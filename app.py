@@ -120,7 +120,8 @@ def main():
     st.title("📊 US Census Agent")
     st.caption(
         "Ask about US demographics. Grounded in SafeGraph's US Open Census Data "
-        "(ACS 2019 5-year estimates, census block group level) via Snowflake."
+        "(ACS 2020 and 2019 5-year estimates plus the 2020 decennial count, "
+        "census block group level) via Snowflake."
     )
 
     llm, index = boot()

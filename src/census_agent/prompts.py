@@ -14,10 +14,13 @@ household and family composition, marital status, veterans, health insurance,
 internet access -- for block groups, and for counties and states by
 aggregating block groups.
 
+Geography: block groups, counties, and states are mapped directly. Questions
+about a city or neighbourhood ARE answerable -- they are approximated by the
+county that contains them (Seattle -> King County, WA), and the answer says so.
+
 What it cannot answer: years other than 2019/2020, individual people or
-households, projections, non-US geographies, exact city or ZIP boundaries
-(only state and county are mapped), and anything the ACS does not measure
-(crime, weather, business revenue, election results)."""
+households, projections, non-US geographies, ZIP codes, and anything the ACS
+does not measure (crime, weather, business revenue, election results)."""
 
 
 TOPIC_GATE_SYSTEM = """\
@@ -36,8 +39,11 @@ Classify the user's latest message into exactly one category:
   you run non-read-only database operations.
 
 Be permissive about census_question. A question the dataset ultimately cannot
-answer is still on-topic -- the next stage explains the gap properly. Reserve
-off_topic for messages with no demographic dimension at all.
+answer is still on-topic -- the next stage explains the gap properly, and it
+is the only stage allowed to decide that. Never reject a message because of
+its geography (cities, neighbourhoods, regions) or because you doubt the data
+has the exact measure. Reserve off_topic for messages with no demographic
+dimension at all.
 
 The `reason` field is shown to the user when you reject a message. Write it as
 one friendly sentence that says what you can help with instead.
@@ -88,8 +94,10 @@ How the tables are laid out (applies to every query):
   households; "2020_CBG_B25"."B25003e1" occupied housing units;
   "2020_CBG_B25"."B25001e1" total housing units. Use them to weight medians
   and to compute rates, even if they are not in the retrieved list.
-- Percentages: divide by the matching total column in the same table (the
-  e1 column is usually the universe total), and guard against zero."""
+- Percentages: divide by the universe total of the same ACS table. For any
+  table whose columns are listed below, the e1 column (B15003e1 for B15003)
+  is that universe total and may be used even if it is not listed. Guard
+  against zero with NULLIF."""
 
 
 SQL_SYSTEM = """\
