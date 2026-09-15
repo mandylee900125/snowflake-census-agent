@@ -5,9 +5,10 @@ app never has to introspect thousands of columns on boot.
 
     python scripts/build_index.py
 
-If field descriptions aren't picked up automatically, run
-scripts/explore_schema.py to see how the metadata table is keyed and set
---desc-table / --code-col / --desc-col accordingly.
+The share's layout (two ACS vintages, estimate/margin-of-error column pairs,
+a 10-level description hierarchy, a separate decennial table) is handled in
+census_layout.py. This script only fetches the raw material and reports on
+what the index can find.
 """
 import argparse
 import os
@@ -15,82 +16,109 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 
-from census_agent import config, snowflake_client  # noqa: E402
-from census_agent.schema_index import SchemaIndex, build_docs  # noqa: E402
+from census_agent import census_layout, config, snowflake_client  # noqa: E402
+from census_agent.schema_index import SchemaIndex  # noqa: E402
+
+# Newest vintage last so its description wins when both define a code (the
+# 2020 text says "2020 inflation-adjusted dollars", which is what the default
+# table actually contains).
+ACS_META_TABLES = ["2019_METADATA_CBG_FIELD_DESCRIPTIONS", "2020_METADATA_CBG_FIELD_DESCRIPTIONS"]
+REDISTRICTING_META_TABLE = "2020_REDISTRICTING_METADATA_CBG_FIELD_DESCRIPTIONS"
+
+# Questions a reviewer would plausibly ask, with the column each must surface.
+PROBES = [
+    # (question as the retrieval layer sees it, column that must be in the top 20)
+    # Raw phrasings, and phrasings with the gate's Census-vocabulary terms
+    # appended -- that is what the pipeline actually searches with.
+    ("median household income", "B19013e1"),
+    ("renter occupied housing units", "B25003e3"),
+    ("commute to work by bicycle", "B08301e18"),
+    ("median gross rent", "B25064e1"),
+    ("hispanic or latino population", "B03002e12"),
+    ("median age", "B01002e1"),
+    ("total population", "B01003e1"),
+    ("total population 2020 census", "P0010001"),
+    ("asian population", "B02001e5"),
+    ("households with no vehicle", "B25044e3"),
+    ("people who speak spanish at home", "C16002e3"),
+    ("median home value", "B25077e1"),
+    ("veterans", "B21001e2"),
+    ("unemployment rate unemployed civilian labor force", "B23025e5"),
+    ("how many women are there female sex by age", "B01001e26"),
+    ("seniors 65 years and over sex by age", "B01001e20"),
+    ("college degree educational attainment bachelor's degree population 25 years and over", "B15003e22"),
+    ("married couple families household type family households", "B11001e3"),
+]
 
 
-def load_descriptions(table, code_col, desc_cols):
-    """Read {column_code: human description} from the dataset's metadata table.
-
-    This is what makes coded ACS columns (B19013e1) findable by lexical search.
-    """
-    select = ", ".join('"%s"' % c for c in [code_col] + desc_cols)
-    sql = 'SELECT %s FROM "%s"' % (select, table)
-    names, rows = snowflake_client.run_select(sql, max_rows=100000)
-    out = {}
-    for row in rows:
-        code = row[0]
-        if not code:
-            continue
-        parts = [str(v) for v in row[1:] if v not in (None, "", "null")]
-        out[str(code)] = " ".join(parts)
-    return out
-
-
-def autodetect(columns):
-    """Guess the metadata table and its code/description columns."""
-    tables = {}
-    for c in columns:
-        tables.setdefault(c["table"], []).append(c["column"])
-    for table, cols in tables.items():
-        upper = table.upper()
-        if "FIELD" in upper and ("DESCRIPTION" in upper or "METADATA" in upper):
-            code = next((c for c in cols if "FIELD" in c.upper() or "ID" in c.upper()), cols[0])
-            descs = [c for c in cols if c != code]
-            return table, code, descs
-    return None, None, None
+def fetch_rows_as_dicts(table):
+    """SELECT * from a metadata table, as a list of {column: value}."""
+    names, rows = snowflake_client.run_select('SELECT * FROM "%s"' % table, max_rows=100000)
+    return [dict(zip(names, row)) for row in rows]
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--desc-table")
-    parser.add_argument("--code-col")
-    parser.add_argument("--desc-col", action="append", default=[])
     parser.add_argument("--out", default=config.SCHEMA_INDEX_PATH)
     args = parser.parse_args()
 
     print("Introspecting columns…")
     columns = snowflake_client.list_columns()
-    print("  found %d columns" % len(columns))
+    print("  found %d columns across %d tables"
+          % (len(columns), len(set(c["table"] for c in columns))))
 
-    table, code_col, desc_cols = args.desc_table, args.code_col, args.desc_col
-    if not table:
-        table, code_col, desc_cols = autodetect(columns)
-
-    descriptions = {}
-    if table:
-        print("Loading field descriptions from %s (%s -> %s)…" % (table, code_col, desc_cols))
+    acs_meta = {}
+    for table in ACS_META_TABLES:
+        print("Loading %s…" % table)
         try:
-            descriptions = load_descriptions(table, code_col, desc_cols)
-            print("  loaded %d descriptions" % len(descriptions))
-        except Exception as exc:
-            print("  WARNING: could not load descriptions: %s" % exc)
-            print("  Coded columns will be hard to retrieve. Run explore_schema.py.")
-    else:
-        print("WARNING: no field-description table detected. Run explore_schema.py.")
+            rows = fetch_rows_as_dicts(table)
+        except snowflake_client.QueryFailed as exc:
+            print("  WARNING: skipped (%s)" % exc)
+            continue
+        for row in rows:
+            code = row.get("TABLE_ID")
+            if code:
+                acs_meta[str(code)] = row
+        print("  %d descriptions" % len(rows))
 
-    docs = build_docs(columns, descriptions)
+    redistricting_meta = {}
+    print("Loading %s…" % REDISTRICTING_META_TABLE)
+    try:
+        for row in fetch_rows_as_dicts(REDISTRICTING_META_TABLE):
+            code = row.get("COLUMN_ID")
+            if code:
+                redistricting_meta[str(code)] = row
+        print("  %d descriptions" % len(redistricting_meta))
+    except snowflake_client.QueryFailed as exc:
+        print("  WARNING: skipped (%s)" % exc)
+
+    docs = census_layout.build_census_docs(columns, acs_meta, redistricting_meta)
     index = SchemaIndex(docs)
     path = index.save(args.out)
-    described = sum(1 for d in docs if d.description)
-    print("\nWrote %s: %d columns, %d with descriptions (%.0f%%)"
-          % (path, len(docs), described, 100.0 * described / max(len(docs), 1)))
 
-    for probe in ["median household income", "renter occupied housing", "commute by bicycle"]:
-        hits = index.search(probe, limit=3)
-        print("\n  %r ->" % probe)
-        for h in hits:
-            print("     %s -- %s" % (h.qualified_name, h.description[:60]))
+    described = sum(1 for d in docs if d.description)
+    both = sum(1 for d in docs if len(d.vintages) > 1)
+    print("\nWrote %s: %d variables (%d with descriptions, %d present in both ACS vintages)"
+          % (path, len(docs), described, both))
+    undescribed = [d for d in docs if not d.description]
+    if undescribed:
+        print("  Undescribed: %s" % ", ".join(d.qualified_name for d in undescribed[:10]))
+
+    print("\nRetrieval probes (top %d):" % config.MAX_SCHEMA_CANDIDATES)
+    failures = 0
+    for question, expected in PROBES:
+        hits = index.search(question)
+        names = [h.column for h in hits]
+        rank = names.index(expected) + 1 if expected in names else None
+        status = "ok  rank %2d" % rank if rank else "MISS      "
+        failures += rank is None
+        print("  %s  %-40r -> %s" % (status, question, expected))
+        if rank is None:
+            for h in hits[:3]:
+                print("             got %s -- %s" % (h.column, h.description[:70]))
+    if failures:
+        print("\n%d probe(s) missed. Fix retrieval before deploying." % failures)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -171,8 +171,7 @@ class TestConversationContext:
     def test_followup_is_rewritten_before_retrieval(self, index, stub_query):
         stub_query(["INCOME"], [(1,)])
         llm = FakeLLM([
-            on_topic("followup"),
-            {"standalone_question": "What is the median household income in Queens?"},
+            on_topic("followup", standalone="What is the median household income in Queens?"),
             sql_plan("SELECT 1 FROM B19013"),
         ])
         history = [
@@ -182,22 +181,23 @@ class TestConversationContext:
         out = collect(pipeline.answer_question(llm, index, "what about Queens?", history))
         assert any("Queens" in s for s in out["status"])
         # The SQL-generation call must see the resolved question, not "what about Queens?".
-        assert "median household income in Queens" in llm.calls[2]["user"]
+        assert "median household income in Queens" in llm.calls[1]["user"]
 
-    def test_first_turn_skips_the_rewrite_call(self, index, stub_query):
+    def test_missing_rewrite_falls_back_to_the_raw_question(self, index, stub_query):
         stub_query(["N"], [(1,)])
-        llm = FakeLLM([on_topic(), sql_plan("SELECT 1 FROM t")])
-        collect(pipeline.answer_question(llm, index, "median income?"))
-        assert llm.structured_responses == []
-
-    def test_rewrite_failure_falls_back_to_the_raw_question(self, index, stub_query):
-        stub_query(["N"], [(1,)])
-        llm = FakeLLM([
-            on_topic("followup"),
-            LLMUnavailable("rewrite service down"),
-            sql_plan("SELECT 1 FROM t"),
-        ])
-        history = [{"role": "user", "content": "earlier"}]
-        out = collect(pipeline.answer_question(llm, index, "what about Queens?", history))
+        llm = FakeLLM([on_topic("followup", standalone=None), sql_plan("SELECT 1 FROM t")])
+        out = collect(pipeline.answer_question(llm, index, "what about Queens?",
+                                               [{"role": "user", "content": "earlier"}]))
         assert out["data"] is not None  # degraded, but still answered
-        assert not out["error"]
+        assert "what about Queens?" in llm.calls[1]["user"]
+
+    def test_search_terms_widen_retrieval_without_changing_the_question(self, index, stub_query):
+        # "women" matches no column description; the gate's Census-vocabulary
+        # hint ("female") is what lets retrieval find the column.
+        stub_query(["N"], [(1,)])
+        llm = FakeLLM([on_topic(standalone="how many women?", search_terms="female sex by age"),
+                       sql_plan("SELECT 1 FROM t")])
+        collect(pipeline.answer_question(llm, index, "how many women?"))
+        sql_call = llm.calls[1]["user"]
+        assert "Question: how many women?" in sql_call
+        assert "B01001e26" in sql_call

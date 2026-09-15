@@ -52,14 +52,17 @@ def index():
                   "Total: Owner-occupied housing units"),
         ColumnDoc("B08301", "B08301e18", "NUMBER",
                   "Means of transportation to work: Bicycle"),
+        ColumnDoc("B01001", "B01001e26", "NUMBER",
+                  "Sex By Age [universe: Total population]: Total > Female"),
         ColumnDoc("CBG_GEO", "CENSUS_BLOCK_GROUP", "VARCHAR",
                   "Census block group identifier"),
         ColumnDoc("CBG_GEO", "AMOUNT_LAND", "NUMBER", "Land area in square meters"),
     ])
 
 
-def on_topic(category="census_question"):
-    return {"on_topic": True, "category": category, "reason": "ok"}
+def on_topic(category="census_question", standalone=None, search_terms=None):
+    return {"on_topic": True, "category": category, "reason": "ok",
+            "standalone_question": standalone, "search_terms": search_terms}
 
 
 def sql_plan(sql, answerable=True, clarification=None, assumptions=None, explanation="ok"):

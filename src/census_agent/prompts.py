@@ -2,22 +2,27 @@
 from typing import Dict, List
 
 DATASET_DESCRIPTION = """\
-The dataset is SafeGraph's US Open Census Data: American Community Survey (ACS)
-2019 5-year estimates, at Census Block Group (CBG) granularity, plus CBG
-geographic metadata and city/county crosswalks.
+The dataset is SafeGraph's US Open Census Data on Snowflake: American Community
+Survey (ACS) 5-year estimates for 2020 (default) and 2019, plus the 2020
+decennial census redistricting counts, all at Census Block Group (CBG)
+granularity, with a state/county FIPS crosswalk and per-CBG land area and
+coordinates.
 
-What it can answer: demographics (age, sex, race, ethnicity), income and
-employment, education, housing and rent, commuting and transportation,
-language, household composition, and marital status -- for block groups,
-and for cities and counties by aggregating block groups.
+What it can answer: demographics (age, sex, race, ethnicity), income, poverty
+and employment, education, housing, rent and home values, commuting, language,
+household and family composition, marital status, veterans, health insurance,
+internet access -- for block groups, and for counties and states by
+aggregating block groups.
 
-What it cannot answer: any year other than 2019, individual people or
-households, future projections, non-US geographies, or anything the ACS does
-not measure (e.g. crime, weather, business revenue)."""
+What it cannot answer: years other than 2019/2020, individual people or
+households, projections, non-US geographies, exact city or ZIP boundaries
+(only state and county are mapped), and anything the ACS does not measure
+(crime, weather, business revenue, election results)."""
+
 
 TOPIC_GATE_SYSTEM = """\
-You are the input filter for a chat agent that answers questions about US
-Census demographic data.
+You are the input filter and interpreter for a chat agent that answers
+questions about US Census demographic data.
 
 %s
 
@@ -35,7 +40,56 @@ answer is still on-topic -- the next stage explains the gap properly. Reserve
 off_topic for messages with no demographic dimension at all.
 
 The `reason` field is shown to the user when you reject a message. Write it as
-one friendly sentence that says what you can help with instead.""" % DATASET_DESCRIPTION
+one friendly sentence that says what you can help with instead.
+
+For on-topic messages also fill in:
+- `standalone_question`: the message rewritten to stand alone, resolving
+  anything that depends on earlier turns ("there", "that one", "what about
+  Queens?"). Change nothing else -- do not answer it, widen it, or add detail
+  the user did not give. If it already stands alone, copy it unchanged.
+- `search_terms`: 3-8 words in the Census Bureau's own vocabulary that the
+  relevant ACS table labels would contain. Used for lexical search over
+  column descriptions, so translate everyday phrasing into ACS phrasing:
+  "women" -> "female", "seniors" -> "65 years and over", "unemployment" ->
+  "unemployed labor force", "rent" -> "renter occupied gross rent",
+  "college degree" -> "bachelor's degree educational attainment". Do not
+  include place names.""" % DATASET_DESCRIPTION
+
+
+SCHEMA_NOTES = """\
+How the tables are laid out (applies to every query):
+
+- ACS tables are named {vintage}_CBG_{family}: 2020_CBG_B19 holds the B19xxx
+  income variables for the 2020 5-year vintage. Use the 2020 tables unless the
+  user asks for 2019; the 2019 tables have the same columns.
+- Every data table has CENSUS_BLOCK_GROUP (TEXT, 12 digits). Join tables on
+  it. The first 2 digits are the state FIPS, the next 3 the county FIPS.
+- Columns are ACS variable codes: B19013e1 is an estimate, B19013m1 is its
+  margin of error. Only estimates are listed below; you may reference the
+  matching m-column for a listed e-column.
+- Geography: "2020_METADATA_CBG_FIPS_CODES"(STATE two-letter, STATE_FIPS
+  '36', COUNTY_FIPS '047', COUNTY 'Kings County'). Filter with
+  SUBSTR(CENSUS_BLOCK_GROUP, 1, 2) = STATE_FIPS and, for a county,
+  SUBSTR(CENSUS_BLOCK_GROUP, 3, 3) = COUNTY_FIPS. FIPS values are zero-padded
+  strings. There is no city, ZIP, or neighbourhood table: map a place to its
+  county from your own knowledge (Brooklyn = Kings County, NY; San Francisco =
+  San Francisco County, CA) and record that in `assumptions`. If a place spans
+  several counties or you are unsure, ask via `clarification`.
+- "2020_METADATA_CBG_GEOGRAPHIC_DATA"(CENSUS_BLOCK_GROUP, AMOUNT_LAND square
+  metres, AMOUNT_WATER, LATITUDE, LONGITUDE) for density and location.
+- "2020_REDISTRICTING_CBG_DATA" holds 2020 decennial counts (P-codes); it is a
+  full count, not a survey estimate.
+- Aggregation: SUM counts across block groups. Medians (B19013, B25064,
+  B01002, ...) cannot be summed -- for a county or state, report a weighted
+  average of block-group medians and say so in `assumptions`, or return the
+  distribution. Exclude NULL and negative values, which mark suppressed cells.
+- Always-available weighting/denominator columns (join on CENSUS_BLOCK_GROUP):
+  "2020_CBG_B01"."B01003e1" total population; "2020_CBG_B11"."B11001e1" total
+  households; "2020_CBG_B25"."B25003e1" occupied housing units;
+  "2020_CBG_B25"."B25001e1" total housing units. Use them to weight medians
+  and to compute rates, even if they are not in the retrieved list.
+- Percentages: divide by the matching total column in the same table (the
+  e1 column is usually the universe total), and guard against zero."""
 
 
 SQL_SYSTEM = """\
@@ -43,21 +97,23 @@ You translate questions about US Census data into a single Snowflake SQL query.
 
 %s
 
+%s
+
 You will be shown ONLY the columns retrieved as relevant to this question --
 not the full schema, which has thousands of columns. If the columns you need
 are not in the list, the dataset probably cannot answer the question: say so
 via `answerable: false` rather than inventing a column name. Never reference a
-table or column that does not appear in the context below.
+table or column that does not appear in the notes above or the context below.
 
 Rules for the SQL:
 - One statement. SELECT only. Never INSERT, UPDATE, DELETE, or any DDL.
 - Always include a LIMIT.
-- Quote column names exactly as given, including spaces and punctuation:
-  "Total: Renter-occupied housing units".
+- Quote table and column names exactly as given, in double quotes, because
+  they start with digits or are case-sensitive: "2020_CBG_B19"."B19013e1".
 - Prefer explicit aggregation (SUM, AVG, COUNT) over returning raw block-group
-  rows when the question is about a city, county, or state.
-- ACS values are estimates. Margin-of-error columns exist separately; do not
-  sum an estimate column with its margin of error.
+  rows when the question is about a county or state. Return block-group rows
+  only when the user asks for them, and then ORDER BY something meaningful.
+- Do not sum an estimate column with its margin of error.
 
 Set `answerable: false` when:
 - the question needs data this dataset does not contain;
@@ -67,7 +123,7 @@ Set `answerable: false` when:
 
 When a reasonable interpretation exists, take it and record it in
 `assumptions` -- do not refuse a question you could answer under a stated
-assumption."""
+assumption.""" % (DATASET_DESCRIPTION, SCHEMA_NOTES)
 
 
 ANSWER_SYSTEM = """\
@@ -78,8 +134,10 @@ memory, do not extrapolate, and do not estimate values that are not in the
 data. If the result set is empty, say plainly that the query returned no rows
 and suggest what to try instead.
 
-Always note that figures are 2019 ACS 5-year estimates when you report a
-specific number.
+When you report a specific number, say which data it comes from: ACS 2020
+5-year estimates by default, ACS 2019 5-year if the query used 2019_ tables,
+or the 2020 decennial census if it used the redistricting table. Say it once,
+not on every figure.
 
 Lead with the answer in the first sentence. Keep it to a short paragraph
 unless the question genuinely needs more. Mention any assumption that was made
@@ -116,27 +174,6 @@ SQL_SCHEMA = {
     "required": ["answerable", "sql", "assumptions", "clarification", "explanation"],
     "additionalProperties": False,
 }
-
-
-REWRITE_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "standalone_question": {
-            "type": "string",
-            "description": "The latest message rewritten to stand alone, with pronouns and ellipsis resolved from the conversation.",
-        },
-    },
-    "required": ["standalone_question"],
-    "additionalProperties": False,
-}
-
-REWRITE_SYSTEM = """\
-Rewrite the user's latest message as a standalone question, resolving anything
-that depends on earlier turns ("there", "that one", "what about Queens?").
-
-Change nothing else. Do not answer it, do not expand its scope, and do not add
-detail the user did not give. If the message already stands alone, return it
-unchanged."""
 
 
 def render_history(history, limit=8):

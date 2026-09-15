@@ -123,18 +123,30 @@ TOPIC_SCHEMA = {
             "type": "string",
             "description": "One sentence, addressed to the user, explaining the call.",
         },
+        "standalone_question": {
+            "type": ["string", "null"],
+            "description": "The message rewritten to stand alone; null if off-topic.",
+        },
+        "search_terms": {
+            "type": ["string", "null"],
+            "description": "Census-vocabulary keywords for schema search; null if off-topic.",
+        },
     },
-    "required": ["on_topic", "category", "reason"],
+    "required": ["on_topic", "category", "reason", "standalone_question", "search_terms"],
     "additionalProperties": False,
 }
 
 
 class TopicVerdict(object):
-    def __init__(self, on_topic, category, reason):
-        # type: (bool, str, str) -> None
+    def __init__(self, on_topic, category, reason, standalone_question="", search_terms=""):
+        # type: (bool, str, str, str, str) -> None
         self.on_topic = on_topic
         self.category = category
         self.reason = reason
+        # Filled for on-topic messages: the question with follow-up references
+        # resolved, and Census-vocabulary keywords for schema retrieval.
+        self.standalone_question = standalone_question
+        self.search_terms = search_terms
 
     @property
     def should_answer(self):
@@ -145,7 +157,13 @@ class TopicVerdict(object):
 
 def classify_question(llm, question, history=None):
     # type: (object, str, Optional[List[dict]]) -> TopicVerdict
-    """Fast-fail gate. Runs before any schema retrieval or SQL generation."""
+    """Fast-fail gate. Runs before any schema retrieval or SQL generation.
+
+    The same cheap call also resolves follow-ups into a standalone question
+    and suggests Census-vocabulary search terms: it already has the history
+    and the message in front of it, and a second round trip for that would
+    cost another second on every turn.
+    """
     from .prompts import TOPIC_GATE_SYSTEM, render_history
 
     context = render_history(history or [], limit=4)
@@ -163,4 +181,6 @@ def classify_question(llm, question, history=None):
         on_topic=bool(data.get("on_topic")),
         category=str(data.get("category", "off_topic")),
         reason=str(data.get("reason", "")),
+        standalone_question=str(data.get("standalone_question") or ""),
+        search_terms=str(data.get("search_terms") or ""),
     )

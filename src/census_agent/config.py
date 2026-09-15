@@ -47,6 +47,8 @@ SQL_EFFORT = _get("SQL_EFFORT", "medium")
 MAX_ROWS = int(_get("MAX_ROWS", "500"))
 QUERY_TIMEOUT_SECONDS = int(_get("QUERY_TIMEOUT_SECONDS", "30"))
 MAX_SCHEMA_CANDIDATES = int(_get("MAX_SCHEMA_CANDIDATES", "20"))
+# Diversity cap: no single ACS table may fill more than this many slots.
+MAX_CANDIDATES_PER_GROUP = int(_get("MAX_CANDIDATES_PER_GROUP", "5"))
 MAX_HISTORY_TURNS = int(_get("MAX_HISTORY_TURNS", "8"))
 
 SCHEMA_INDEX_PATH = _get("SCHEMA_INDEX_PATH", "schema_index.json")

@@ -4,7 +4,7 @@ Implemented as a generator of events so the UI can show progress while the
 work happens. Each stage can end the turn early with a plain-language message
 -- there is no path where the user gets a blank screen or a stack trace.
 
-    guardrail -> rewrite -> retrieve schema -> generate SQL
+    guardrail (+ rewrite, search terms) -> retrieve schema -> generate SQL
               -> validate -> execute -> (repair once) -> answer
 """
 import logging
@@ -24,33 +24,6 @@ def _event(kind, **kwargs):
     payload = {"type": kind}
     payload.update(kwargs)
     return payload
-
-
-def _rewrite(llm, question, history):
-    # type: (Any, str, List[dict]) -> str
-    """Resolve follow-ups into a standalone question.
-
-    Retrieval and SQL generation both work on one question at a time, so
-    "what about Queens?" has to become a full question before either runs.
-    """
-    if not history:
-        return question
-    try:
-        data = llm.structured(
-            system=prompts.REWRITE_SYSTEM,
-            user="Conversation:\n%s\n\nLatest message: %s" % (
-                prompts.render_history(history, config.MAX_HISTORY_TURNS), question
-            ),
-            schema=prompts.REWRITE_SCHEMA,
-            model=config.GUARDRAIL_MODEL,
-            max_tokens=512,
-        )
-        return data.get("standalone_question") or question
-    except LLMUnavailable:
-        # Rewriting is an optimisation. If it fails, the original question is
-        # still a reasonable input -- don't fail the whole turn over it.
-        log.warning("Question rewrite failed; using the original text.")
-        return question
 
 
 def _generate_sql(llm, question, schema_context, previous_error=None):
@@ -98,14 +71,17 @@ def answer_question(llm, index, question, history=None):
                      "I can only answer questions about US Census demographic data.")
         return
 
-    # 2. Resolve follow-ups against the conversation.
-    standalone = _rewrite(llm, question, history)
+    # 2. The gate also resolved follow-ups ("what about Queens?") into a
+    #    standalone question; retrieval and SQL generation work on that.
+    standalone = verdict.standalone_question or question
     if standalone != question:
         yield _event("status", text="Interpreting as: %s" % standalone)
 
-    # 3. Retrieve the handful of columns that matter.
+    # 3. Retrieve the handful of columns that matter. The gate's Census-
+    #    vocabulary terms are appended so "women" can find "Female".
     yield _event("status", text="Searching %d columns" % len(index))
-    schema_context = index.render_context(standalone)
+    retrieval_query = " ".join(part for part in (standalone, verdict.search_terms) if part)
+    schema_context = index.render_context(retrieval_query)
 
     # 4-6. Generate, validate, execute -- with one repair attempt.
     last_error = None  # type: Optional[str]

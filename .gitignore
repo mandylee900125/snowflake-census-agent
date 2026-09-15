@@ -6,6 +6,5 @@ venv/
 .streamlit/secrets.toml
 .pytest_cache/
 .cache/
-schema_index.json
 *.egg-info/
 .DS_Store
