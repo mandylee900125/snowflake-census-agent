@@ -1,0 +1,190 @@
+"""Orchestration: question in, grounded answer out.
+
+Implemented as a generator of events so the UI can show progress while the
+work happens. Each stage can end the turn early with a plain-language message
+-- there is no path where the user gets a blank screen or a stack trace.
+
+    guardrail -> rewrite -> retrieve schema -> generate SQL
+              -> validate -> execute -> (repair once) -> answer
+"""
+import logging
+from typing import Any, Dict, Iterator, List, Optional
+
+from . import config, guardrails, prompts, snowflake_client
+from .llm import LLMUnavailable
+from .schema_index import SchemaIndex
+
+log = logging.getLogger(__name__)
+
+MAX_SQL_ATTEMPTS = 2
+
+
+def _event(kind, **kwargs):
+    # type: (str, Any) -> Dict[str, Any]
+    payload = {"type": kind}
+    payload.update(kwargs)
+    return payload
+
+
+def _rewrite(llm, question, history):
+    # type: (Any, str, List[dict]) -> str
+    """Resolve follow-ups into a standalone question.
+
+    Retrieval and SQL generation both work on one question at a time, so
+    "what about Queens?" has to become a full question before either runs.
+    """
+    if not history:
+        return question
+    try:
+        data = llm.structured(
+            system=prompts.REWRITE_SYSTEM,
+            user="Conversation:\n%s\n\nLatest message: %s" % (
+                prompts.render_history(history, config.MAX_HISTORY_TURNS), question
+            ),
+            schema=prompts.REWRITE_SCHEMA,
+            model=config.GUARDRAIL_MODEL,
+            max_tokens=512,
+        )
+        return data.get("standalone_question") or question
+    except LLMUnavailable:
+        # Rewriting is an optimisation. If it fails, the original question is
+        # still a reasonable input -- don't fail the whole turn over it.
+        log.warning("Question rewrite failed; using the original text.")
+        return question
+
+
+def _generate_sql(llm, question, schema_context, previous_error=None):
+    # type: (Any, str, str, Optional[str]) -> Dict[str, Any]
+    user = "Relevant columns:\n%s\n\nQuestion: %s" % (schema_context, question)
+    if previous_error:
+        user += (
+            "\n\nYour previous query failed with this error:\n%s\n"
+            "Write a corrected query, or set answerable to false if it cannot "
+            "be fixed with the columns above." % previous_error
+        )
+    return llm.structured(
+        system=prompts.SQL_SYSTEM,
+        user=user,
+        schema=prompts.SQL_SCHEMA,
+        model=config.SQL_MODEL,
+        effort=config.SQL_EFFORT,
+        max_tokens=8000,
+    )
+
+
+def _explain_unanswerable(plan):
+    # type: (Dict[str, Any]) -> str
+    parts = [plan.get("explanation") or "I can't answer that from this dataset."]
+    if plan.get("clarification"):
+        parts.append(plan["clarification"])
+    return " ".join(p for p in parts if p)
+
+
+def answer_question(llm, index, question, history=None):
+    # type: (Any, SchemaIndex, str, Optional[List[dict]]) -> Iterator[Dict[str, Any]]
+    """Run one turn. Yields status / sql / data / token / message / error events."""
+    history = history or []
+
+    # 1. Fast-fail gate, before any expensive work.
+    yield _event("status", text="Checking the question")
+    try:
+        verdict = guardrails.classify_question(llm, question, history)
+    except LLMUnavailable as exc:
+        yield _event("error", text=str(exc))
+        return
+
+    if not verdict.should_answer:
+        yield _event("message", text=verdict.reason or
+                     "I can only answer questions about US Census demographic data.")
+        return
+
+    # 2. Resolve follow-ups against the conversation.
+    standalone = _rewrite(llm, question, history)
+    if standalone != question:
+        yield _event("status", text="Interpreting as: %s" % standalone)
+
+    # 3. Retrieve the handful of columns that matter.
+    yield _event("status", text="Searching %d columns" % len(index))
+    schema_context = index.render_context(standalone)
+
+    # 4-6. Generate, validate, execute -- with one repair attempt.
+    last_error = None  # type: Optional[str]
+    columns = None  # type: Optional[List[str]]
+    rows = None  # type: Optional[List[tuple]]
+    plan = {}  # type: Dict[str, Any]
+    safe_sql = None  # type: Optional[str]
+
+    for attempt in range(MAX_SQL_ATTEMPTS):
+        yield _event("status", text="Writing SQL" if attempt == 0 else "Fixing the query")
+        try:
+            plan = _generate_sql(llm, standalone, schema_context, last_error)
+        except LLMUnavailable as exc:
+            yield _event("error", text=str(exc))
+            return
+
+        if not plan.get("answerable"):
+            yield _event("message", text=_explain_unanswerable(plan))
+            return
+
+        try:
+            safe_sql = guardrails.validate_sql(plan.get("sql") or "")
+        except guardrails.UnsafeSQL as exc:
+            last_error = str(exc)
+            log.warning("Rejected generated SQL: %s", exc)
+            continue
+
+        yield _event("sql", sql=safe_sql)
+        yield _event("status", text="Querying Snowflake")
+        try:
+            columns, rows = snowflake_client.run_select(safe_sql)
+            break
+        except snowflake_client.SnowflakeUnavailable as exc:
+            log.exception("Snowflake unavailable")
+            yield _event("error", text=(
+                "I'm having trouble connecting to the Census database, so I "
+                "can't look this up right now. The question itself was fine -- "
+                "please try again in a moment."
+            ))
+            return
+        except snowflake_client.QueryFailed as exc:
+            last_error = str(exc)
+            log.warning("Query failed on attempt %d: %s", attempt + 1, exc)
+            continue
+
+    if rows is None:
+        yield _event("message", text=(
+            "I understood the question but couldn't build a working query for "
+            "it against this dataset. The last problem was: %s" % (last_error or "unknown")
+        ))
+        return
+
+    yield _event("data", columns=columns, rows=rows)
+
+    # 7. Explain the rows -- and only the rows.
+    yield _event("status", text="Writing the answer")
+    answer_prompt = (
+        "Question: %s\n\nSQL that was run:\n%s\n\nResults:\n%s\n\nAssumptions made: %s"
+        % (
+            standalone,
+            safe_sql,
+            prompts.render_results(columns, rows),
+            "; ".join(plan.get("assumptions") or []) or "none",
+        )
+    )
+    messages = [{"role": "user", "content": answer_prompt}]
+    try:
+        for token in llm.stream_text(
+            system=prompts.ANSWER_SYSTEM,
+            messages=messages,
+            model=config.SQL_MODEL,
+            effort=config.SQL_EFFORT,
+        ):
+            yield _event("token", text=token)
+    except LLMUnavailable as exc:
+        yield _event("error", text=(
+            "I got the data but couldn't write the summary: %s You can still "
+            "read the query results above." % exc
+        ))
+        return
+
+    yield _event("done")

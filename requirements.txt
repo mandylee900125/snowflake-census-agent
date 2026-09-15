@@ -1,0 +1,6 @@
+streamlit>=1.40
+anthropic>=0.69
+snowflake-connector-python>=3.12
+rank-bm25>=0.2.2
+python-dotenv>=1.0
+pytest>=8.0
