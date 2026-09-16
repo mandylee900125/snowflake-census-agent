@@ -21,7 +21,7 @@ class FakeLLM(object):
         self._stream_text = stream_text
         self.calls = []
 
-    def structured(self, system, user, schema, model=None, max_tokens=None, effort=None):
+    def structured(self, system, user, schema, model=None, max_tokens=None, effort=None, timeout=None):
         self.calls.append({"system": system, "user": user, "model": model})
         if not self.structured_responses:
             raise AssertionError("FakeLLM ran out of scripted structured responses")
@@ -30,7 +30,7 @@ class FakeLLM(object):
             raise response
         return response
 
-    def stream_text(self, system, messages, model=None, max_tokens=None, effort=None):
+    def stream_text(self, system, messages, model=None, max_tokens=None, effort=None, timeout=None):
         self.calls.append({"system": system, "messages": messages, "model": model})
         for word in self._stream_text.split():
             yield word + " "
@@ -65,11 +65,13 @@ def on_topic(category="census_question", standalone=None, search_terms=None):
             "standalone_question": standalone, "search_terms": search_terms}
 
 
-def sql_plan(sql, answerable=True, clarification=None, assumptions=None, explanation="ok"):
+def sql_plan(sql, answerable=True, clarification=None, assumptions=None, explanation="ok",
+             decline_reason=None):
     return {
         "answerable": answerable,
         "sql": sql,
         "assumptions": assumptions or [],
         "clarification": clarification,
+        "decline_reason": decline_reason or (None if answerable else "not_in_dataset"),
         "explanation": explanation,
     }

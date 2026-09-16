@@ -129,10 +129,13 @@ Rules for the SQL:
 - Do not sum an estimate column with its margin of error.
 
 Set `answerable: false` when:
-- the question needs data this dataset does not contain;
-- the question is too ambiguous to resolve (put the question you would ask the
-  user in `clarification`);
-- the retrieved columns are clearly unrelated to what was asked.
+- the question needs data this dataset does not contain
+  (`decline_reason: "not_in_dataset"` -- the ACS does not measure it);
+- the measure probably exists in the ACS but is not in the retrieved list
+  (`decline_reason: "missing_columns"` -- a search miss; you will be shown a
+  wider list once);
+- the question is too ambiguous to resolve (`decline_reason: "ambiguous"`;
+  put the question you would ask the user in `clarification`).
 
 When a reasonable interpretation exists, take it and record it in
 `assumptions` -- do not refuse a question you could answer under a stated
@@ -182,12 +185,19 @@ SQL_SCHEMA = {
             "type": ["string", "null"],
             "description": "A question to ask the user, if the request is too ambiguous.",
         },
+        "decline_reason": {
+            "anyOf": [
+                {"type": "string", "enum": ["not_in_dataset", "missing_columns", "ambiguous"]},
+                {"type": "null"},
+            ],
+            "description": "Why answerable is false; null when answerable.",
+        },
         "explanation": {
             "type": "string",
             "description": "One sentence addressed to the user: what the query does, or why the question can't be answered from this data. Never mention SQL, columns, or tables.",
         },
     },
-    "required": ["answerable", "sql", "assumptions", "clarification", "explanation"],
+    "required": ["answerable", "sql", "assumptions", "clarification", "decline_reason", "explanation"],
     "additionalProperties": False,
 }
 

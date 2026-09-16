@@ -119,3 +119,40 @@ class TestAdministrativeFunctions:
     def test_system_inside_a_quoted_identifier_is_fine(self):
         from census_agent.guardrails import validate_sql
         assert validate_sql('SELECT "SYSTEM$-like label" FROM t LIMIT 5')
+
+
+
+class TestFindingsFromExternalReview:
+    """Two gaps found by a second reviewer, kept as regressions."""
+
+    def test_limit_inside_a_subquery_does_not_satisfy_the_outer_limit(self):
+        from census_agent.guardrails import validate_sql
+        sql = 'SELECT * FROM (SELECT "B01003e1" FROM "2020_CBG_B01" LIMIT 10) sub'
+        out = validate_sql(sql, max_rows=500)
+        assert out.rstrip().upper().endswith("LIMIT 500"), out
+
+    def test_limit_in_a_cte_does_not_count_either(self):
+        from census_agent.guardrails import validate_sql
+        sql = 'WITH t AS (SELECT 1 AS x LIMIT 5) SELECT x FROM t'
+        assert validate_sql(sql, max_rows=500).rstrip().upper().endswith("LIMIT 500")
+
+    def test_top_level_limit_is_still_clamped_not_duplicated(self):
+        from census_agent.guardrails import validate_sql
+        sql = 'SELECT * FROM (SELECT 1 LIMIT 5) s LIMIT 9000'
+        out = validate_sql(sql, max_rows=500)
+        assert out.count("LIMIT") == 2 and out.rstrip().endswith("LIMIT 500")
+
+    def test_double_dash_inside_a_string_literal_survives(self):
+        from census_agent.guardrails import validate_sql
+        sql = "SELECT COUNTY FROM \"2020_METADATA_CBG_FIPS_CODES\" WHERE COUNTY = 'Wilkes--Barre' LIMIT 5"
+        assert "'Wilkes--Barre'" in validate_sql(sql)
+
+    def test_semicolon_inside_a_string_literal_is_not_a_second_statement(self):
+        from census_agent.guardrails import validate_sql
+        assert validate_sql("SELECT 'a;b' AS x LIMIT 1")
+
+    def test_comments_are_executed_as_written_but_not_scanned(self):
+        from census_agent.guardrails import UnsafeSQL, validate_sql
+        with pytest.raises(UnsafeSQL):
+            validate_sql("SELECT 1 /* harmless */; DROP TABLE x")
+        assert "-- note" in validate_sql("SELECT 1 -- note\nLIMIT 1")

@@ -36,22 +36,41 @@ class UnsafeSQL(ValueError):
     """The generated SQL is not a safe read-only query."""
 
 
-def _strip_comments(sql):
-    # type: (str) -> str
-    return _BLOCK_COMMENT.sub(" ", _LINE_COMMENT.sub(" ", sql))
+def _blank(match):
+    # type: (re.Match) -> str
+    """Replace a match with spaces of the same length, keeping the outer
+    quotes of a literal so the SQL still parses. Length-preserving so that
+    positions found in the masked text apply to the original."""
+    text = match.group(0)
+    if text[0] in "'\"" and len(text) >= 2:
+        return text[0] + " " * (len(text) - 2) + text[0]
+    return " " * len(text)
 
 
 def _mask_literals(sql):
     # type: (str) -> str
-    """Blank out string literals and quoted identifiers before keyword scanning.
+    """Blank out string literals and quoted identifiers before scanning.
 
-    Census column names are quoted free text -- e.g.
-    "Total: Renter-occupied housing units" -- and a naive keyword scan over
-    raw SQL would flag legitimate identifiers containing words like GET or SET.
+    Census column names are quoted free text -- "Total: Renter-occupied
+    housing units" -- and a naive keyword scan would flag legitimate
+    identifiers containing words like GET or SET. Literals are masked
+    BEFORE comments are stripped, so a literal containing -- survives.
     """
-    sql = _SINGLE_QUOTED.sub("''", sql)
-    sql = _DOUBLE_QUOTED.sub('""', sql)
+    sql = _SINGLE_QUOTED.sub(_blank, sql)
+    sql = _DOUBLE_QUOTED.sub(_blank, sql)
     return sql
+
+
+def _strip_comments(sql):
+    # type: (str) -> str
+    """Blank comments (length-preserving). Call on masked text only."""
+    return _BLOCK_COMMENT.sub(_blank, _LINE_COMMENT.sub(_blank, sql))
+
+
+def _analysis_view(sql):
+    # type: (str) -> str
+    """The text we scan: literals masked, then comments blanked, same length as `sql`."""
+    return _strip_comments(_mask_literals(sql))
 
 
 def validate_sql(sql, max_rows=None):
@@ -63,50 +82,57 @@ def validate_sql(sql, max_rows=None):
       * it is a SELECT (or a WITH ... SELECT)
       * it contains no data-modifying or session-modifying keyword, and no
         SYSTEM$ administrative function
-      * it has a LIMIT no larger than max_rows
+      * its outermost query has a LIMIT no larger than max_rows
+
+    The returned SQL is the model's text with only a trailing semicolon
+    removed and the LIMIT adjusted -- comments and literals are executed
+    as written; all scanning happens on a masked copy of the same length.
     """
     max_rows = max_rows or config.MAX_ROWS
 
     if not sql or not sql.strip():
         raise UnsafeSQL("The model returned an empty query.")
 
-    cleaned = _strip_comments(sql).strip()
-    masked = _mask_literals(cleaned)
+    body = sql.strip().rstrip(";").rstrip()
+    view = _analysis_view(body)
 
-    # One statement only. A trailing semicolon is fine; a second statement
-    # is a classic injection shape (SELECT 1; DROP TABLE x).
-    statements = [s for s in masked.split(";") if s.strip()]
-    if len(statements) > 1:
+    # One statement only. A second statement is a classic injection shape
+    # (SELECT 1; DROP TABLE x). Semicolons inside literals are masked.
+    if [part for part in view.split(";") if part.strip()][1:]:
         raise UnsafeSQL("Only one SQL statement may be executed at a time.")
 
-    body = cleaned.rstrip().rstrip(";").rstrip()
-    masked_body = _mask_literals(_strip_comments(body))
-
-    first = masked_body.lstrip().split(None, 1)
+    first = view.split(None, 1)
     first_word = first[0].upper() if first else ""
     if first_word not in ("SELECT", "WITH"):
         raise UnsafeSQL(
             "Only SELECT queries are allowed; this one started with '%s'." % (first_word or "nothing")
         )
 
-    words = set(re.findall(r"[A-Za-z_]+", masked_body.upper()))
+    words = set(re.findall(r"[A-Za-z_]+", view.upper()))
     banned = sorted(words & FORBIDDEN_KEYWORDS)
     if banned:
         raise UnsafeSQL("Query contains disallowed keyword(s): %s." % ", ".join(banned))
-    if _SYSTEM_FUNCTION.search(masked_body):
+    if _SYSTEM_FUNCTION.search(view):
         raise UnsafeSQL("Query calls a SYSTEM$ administrative function.")
 
-    return _enforce_limit(body, max_rows)
+    return _enforce_limit(body, view, max_rows)
 
 
-def _enforce_limit(sql, max_rows):
-    # type: (str, int) -> str
-    """Ensure a LIMIT exists and is no larger than max_rows."""
-    matches = list(_LIMIT_CLAUSE.finditer(_mask_literals(sql)))
-    if not matches:
+def _enforce_limit(sql, view, max_rows):
+    # type: (str, str, int) -> str
+    """Ensure the OUTERMOST query has a LIMIT no larger than max_rows.
+
+    A LIMIT inside a subquery or CTE does not bound the result, so only a
+    LIMIT at parenthesis depth zero counts. `view` is the masked analysis
+    text, same length as `sql`, so match positions carry over.
+    """
+    top_level = [
+        m for m in _LIMIT_CLAUSE.finditer(view)
+        if view.count("(", 0, m.start()) == view.count(")", 0, m.start())
+    ]
+    if not top_level:
         return "%s\nLIMIT %d" % (sql.rstrip(), max_rows)
-
-    last = matches[-1]
+    last = top_level[-1]
     if int(last.group(1)) <= max_rows:
         return sql
     return sql[:last.start()] + ("LIMIT %d" % max_rows) + sql[last.end():]
@@ -161,8 +187,8 @@ class TopicVerdict(object):
         return self.on_topic and self.category in ("census_question", "followup")
 
 
-def classify_question(llm, question, history=None):
-    # type: (object, str, Optional[List[dict]]) -> TopicVerdict
+def classify_question(llm, question, history=None, timeout=None):
+    # type: (object, str, Optional[List[dict]], Optional[float]) -> TopicVerdict
     """Fast-fail gate. Runs before any schema retrieval or SQL generation.
 
     The same cheap call also resolves follow-ups into a standalone question
@@ -172,7 +198,7 @@ def classify_question(llm, question, history=None):
     """
     from .prompts import TOPIC_GATE_SYSTEM, render_history
 
-    context = render_history(history or [], limit=4)
+    context = render_history(history or [], limit=config.MAX_HISTORY_TURNS)
     user = "Recent conversation:\n%s\n\nClassify this message:\n%s" % (
         context or "(none)", question
     )
@@ -182,6 +208,7 @@ def classify_question(llm, question, history=None):
         schema=TOPIC_SCHEMA,
         model=config.GUARDRAIL_MODEL,
         max_tokens=512,
+        timeout=timeout,
     )
     return TopicVerdict(
         on_topic=bool(data.get("on_topic")),

@@ -27,8 +27,8 @@ def _event(kind, **kwargs):
     return payload
 
 
-def _generate_sql(llm, question, schema_context, previous_error=None):
-    # type: (Any, str, str, Optional[str]) -> Dict[str, Any]
+def _generate_sql(llm, question, schema_context, previous_error=None, timeout=None):
+    # type: (Any, str, str, Optional[str], Optional[float]) -> Dict[str, Any]
     user = "Relevant columns:\n%s\n\nQuestion: %s" % (schema_context, question)
     if previous_error:
         user += (
@@ -43,7 +43,14 @@ def _generate_sql(llm, question, schema_context, previous_error=None):
         model=config.SQL_MODEL,
         effort=config.SQL_EFFORT,
         max_tokens=8000,
+        timeout=timeout,
     )
+
+
+def _remaining(started):
+    # type: (float) -> float
+    """Seconds left in the turn's budget."""
+    return config.TURN_BUDGET_SECONDS - (time.monotonic() - started)
 
 
 def _query_timeout(started):
@@ -72,7 +79,7 @@ def answer_question(llm, index, question, history=None):
     # 1. Fast-fail gate, before any expensive work.
     yield _event("status", text="Checking the question")
     try:
-        verdict = guardrails.classify_question(llm, question, history)
+        verdict = guardrails.classify_question(llm, question, history, timeout=_remaining(started))
     except LLMUnavailable as exc:
         yield _event("error", text=str(exc))
         return
@@ -101,6 +108,7 @@ def answer_question(llm, index, question, history=None):
     plan = {}  # type: Dict[str, Any]
     safe_sql = None  # type: Optional[str]
     out_of_time = False
+    widened = False
 
     for attempt in range(MAX_SQL_ATTEMPTS):
         if attempt > 0 and time.monotonic() - started > config.REPAIR_CUTOFF_SECONDS:
@@ -111,14 +119,32 @@ def answer_question(llm, index, question, history=None):
             break
         yield _event("status", text="Writing SQL" if attempt == 0 else "Fixing the query")
         try:
-            plan = _generate_sql(llm, standalone, schema_context, last_error)
+            plan = _generate_sql(llm, standalone, schema_context, last_error,
+                                 timeout=_remaining(started) - config.ANSWER_RESERVE_SECONDS)
         except LLMUnavailable as exc:
             yield _event("error", text=str(exc))
             return
 
         if not plan.get("answerable"):
-            yield _event("message", text=_explain_unanswerable(plan))
-            return
+            # "I couldn't find the columns" is a search miss, not proof the
+            # data is absent. Look once more, wider, before telling the user
+            # the dataset lacks it.
+            if plan.get("decline_reason") == "missing_columns" and not widened \
+                    and _remaining(started) > config.REPAIR_CUTOFF_SECONDS:
+                widened = True
+                yield _event("status", text="Searching more widely")
+                schema_context = index.render_context(
+                    retrieval_query, limit=config.WIDE_SCHEMA_CANDIDATES,
+                    max_per_group=config.WIDE_CANDIDATES_PER_GROUP)
+                try:
+                    plan = _generate_sql(llm, standalone, schema_context, None,
+                                         timeout=_remaining(started) - config.ANSWER_RESERVE_SECONDS)
+                except LLMUnavailable as exc:
+                    yield _event("error", text=str(exc))
+                    return
+            if not plan.get("answerable"):
+                yield _event("message", text=_explain_unanswerable(plan))
+                return
 
         try:
             safe_sql = guardrails.validate_sql(plan.get("sql") or "")
@@ -144,7 +170,9 @@ def answer_question(llm, index, question, history=None):
             return
         except snowflake_client.QueryFailed as exc:
             last_error = str(exc)
-            log.warning("Query failed on attempt %d: %s", attempt + 1, exc)
+            # Log the SQL too: a flaky live test is undiagnosable from the
+            # error text alone.
+            log.warning("Query failed on attempt %d: %s\nSQL: %s", attempt + 1, exc, safe_sql)
             continue
 
     if rows is None:
@@ -159,6 +187,12 @@ def answer_question(llm, index, question, history=None):
     yield _event("data", columns=columns, rows=rows)
 
     # 7. Explain the rows -- and only the rows.
+    if _remaining(started) < config.MIN_LLM_CALL_SECONDS:
+        yield _event("message", text=(
+            "I ran the query but ran out of time to write the summary. The "
+            "results are shown above."
+        ))
+        return
     yield _event("status", text="Writing the answer")
     answer_prompt = (
         "Question: %s\n\nSQL that was run:\n%s\n\nResults:\n%s\n\nAssumptions made: %s"
@@ -176,6 +210,7 @@ def answer_question(llm, index, question, history=None):
             messages=messages,
             model=config.SQL_MODEL,
             effort=config.SQL_EFFORT,
+            timeout=_remaining(started),
         ):
             yield _event("token", text=token)
     except LLMUnavailable as exc:

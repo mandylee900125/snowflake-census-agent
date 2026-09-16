@@ -47,7 +47,33 @@ def get_connection():
         raise SnowflakeUnavailable(
             "Could not connect to Snowflake: %s" % exc
         ) from exc
+    _check_role(_connection)
     return _connection
+
+
+ADMIN_ROLES = ("ACCOUNTADMIN", "SECURITYADMIN", "SYSADMIN", "USERADMIN")
+
+
+def _check_role(conn):
+    """Verify the session got the configured role, and warn loudly if it is
+    an administrative one. Configuration says what we asked for; this says
+    what we actually got."""
+    try:
+        cur = conn.cursor()
+        try:
+            cur.execute("SELECT CURRENT_ROLE()")
+            role = (cur.fetchone() or [""])[0] or ""
+        finally:
+            cur.close()
+    except Exception:  # pragma: no cover - diagnostics must never break connect
+        log.warning("Could not verify the Snowflake role")
+        return
+    wanted = (config._get("SNOWFLAKE_ROLE") or "").upper()
+    if wanted and role.upper() != wanted:
+        log.warning("Snowflake session role is %s, not the configured %s", role, wanted)
+    if role.upper() in ADMIN_ROLES:
+        log.warning("Snowflake session is running as %s. Use the read-only role "
+                    "from scripts/create_readonly_role.sql.", role)
 
 
 def _is_query_error(exc):

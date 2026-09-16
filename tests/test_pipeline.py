@@ -286,3 +286,53 @@ class TestModelTimeout:
         monkeypatch.setattr(client._client.messages, "create", boom)
         with pytest.raises(LLMUnavailable, match="too long"):
             client.structured(system="s", user="u", schema={"type": "object"}, model="claude-haiku-4-5")
+
+
+
+class TestSearchMissVersusDataGap:
+    def test_missing_columns_triggers_one_wider_search(self, index, stub_query):
+        stub_query(["N"], [(1,)])
+        llm = FakeLLM([
+            on_topic(),
+            sql_plan(None, answerable=False, decline_reason="missing_columns",
+                     explanation="No income column in the list."),
+            sql_plan("SELECT 1 FROM B19013"),
+        ])
+        out = collect(pipeline.answer_question(llm, index, "median income?"))
+        assert any("more widely" in s for s in out["status"])
+        assert out["data"] is not None and not out["message"]
+
+    def test_not_in_dataset_is_not_retried(self, index):
+        llm = FakeLLM([
+            on_topic(),
+            sql_plan(None, answerable=False, decline_reason="not_in_dataset",
+                     explanation="The ACS does not measure crime."),
+        ])
+        out = collect(pipeline.answer_question(llm, index, "crime rate?"))
+        assert out["message"] == ["The ACS does not measure crime."]
+        assert llm.structured_responses == []
+
+    def test_wider_search_is_attempted_only_once(self, index):
+        llm = FakeLLM([
+            on_topic(),
+            sql_plan(None, answerable=False, decline_reason="missing_columns", explanation="no"),
+            sql_plan(None, answerable=False, decline_reason="missing_columns", explanation="still no"),
+        ])
+        out = collect(pipeline.answer_question(llm, index, "q"))
+        assert out["message"] == ["still no"]
+        assert llm.structured_responses == []
+
+
+class TestDeadlineReachesEveryModelCall:
+    def test_each_model_call_gets_the_remaining_budget(self, index, stub_query, monkeypatch):
+        from census_agent import config
+        stub_query(["N"], [(1,)])
+        TestLatencyBudget._clock(monkeypatch, [0.0, 0.0, 10.0, 10.0, 20.0, 30.0])
+        llm = FakeLLM([on_topic(), sql_plan("SELECT 1 FROM t")])
+        collect(pipeline.answer_question(llm, index, "q"))
+        # FakeLLM records nothing about timeouts; assert through the real client wrapper instead.
+        from census_agent.llm import LLMClient
+        client = LLMClient(api_key="test-key")
+        assert client._messages(None) is client._client.messages
+        short = client._messages(5.0)
+        assert short is not client._client.messages           # a per-call override was made

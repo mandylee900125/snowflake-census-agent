@@ -271,10 +271,10 @@ class SchemaIndex(object):
                 break
         return out
 
-    def render_context(self, query, limit=None):
-        # type: (str, Optional[int]) -> str
+    def render_context(self, query, limit=None, max_per_group=None):
+        # type: (str, Optional[int], Optional[int]) -> str
         """The schema snippet injected into the SQL-generation prompt."""
-        hits = self.search(query, limit)
+        hits = self.search(query, limit, max_per_group)
         if not hits:
             return "(no columns in the dataset matched this question)"
         by_table = {}  # type: Dict[str, List[ColumnDoc]]

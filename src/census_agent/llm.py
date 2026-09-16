@@ -119,11 +119,22 @@ class LLMClient(object):
                 % (" (%s)" % category if category else "")
             )
 
-    def _call(self, **kwargs):
-        # type: (Any) -> Any
+    def _messages(self, timeout=None):
+        # type: (Optional[float]) -> Any
+        """The messages resource, with a per-call deadline when the caller
+        has one. A retry could double the wall time, so it is only allowed
+        when the deadline leaves room for it."""
+        if timeout is None:
+            return self._client.messages
+        timeout = max(1.0, float(timeout))
+        retries = 1 if timeout >= 2 * config.MIN_LLM_CALL_SECONDS else 0
+        return self._client.with_options(timeout=timeout, max_retries=retries).messages
+
+    def _call(self, timeout=None, **kwargs):
+        # type: (Optional[float], Any) -> Any
         a = self._anthropic
         try:
-            response = self._client.messages.create(**kwargs)
+            response = self._messages(timeout).create(**kwargs)
             self._record_usage(kwargs.get("model", "?"), response)
             return response
         except a.RateLimitError as exc:
@@ -144,7 +155,7 @@ class LLMClient(object):
 
     # --- public API ---------------------------------------------------------
 
-    def structured(self, system, user, schema, model=None, max_tokens=8000, effort=None):
+    def structured(self, system, user, schema, model=None, max_tokens=8000, effort=None, timeout=None):
         # type: (str, str, dict, Optional[str], int, Optional[str]) -> Dict[str, Any]
         """Call the model and get back a dict matching `schema`.
 
@@ -153,6 +164,7 @@ class LLMClient(object):
         """
         model = model or config.SQL_MODEL
         response = self._call(
+            timeout=timeout,
             model=model,
             max_tokens=max_tokens,
             system=self._system_blocks(system),
@@ -168,7 +180,7 @@ class LLMClient(object):
         except ValueError as exc:
             raise LLMUnavailable("The model returned malformed JSON.") from exc
 
-    def stream_text(self, system, messages, model=None, max_tokens=4000, effort=None):
+    def stream_text(self, system, messages, model=None, max_tokens=4000, effort=None, timeout=None):
         # type: (str, List[dict], Optional[str], int, Optional[str]) -> Iterator[str]
         """Stream a prose answer token by token.
 
@@ -179,7 +191,7 @@ class LLMClient(object):
         model = model or config.SQL_MODEL
         a = self._anthropic
         try:
-            with self._client.messages.stream(
+            with self._messages(timeout).stream(
                 model=model,
                 max_tokens=max_tokens,
                 system=self._system_blocks(system),
