@@ -17,6 +17,24 @@ from census_agent.llm import LLMClient  # noqa: E402
 from census_agent.pipeline import answer_question  # noqa: E402
 from census_agent.schema_index import SchemaIndex  # noqa: E402
 
+# USD per million tokens: (input, output, cache read, cache write).
+# Source: Anthropic pricing page, checked 2026-09-15.
+PRICES = {
+    "claude-opus-5": (5.00, 25.00, 0.50, 6.25),
+    "claude-haiku-4-5": (1.00, 5.00, 0.10, 1.25),
+}
+
+
+def cost_usd(usage):
+    total = 0.0
+    for model, u in usage.items():
+        p = next((v for k, v in PRICES.items() if model.startswith(k)), None)
+        if not p:
+            continue
+        total += (u["input"] * p[0] + u["output"] * p[1]
+                  + u["cache_read"] * p[2] + u["cache_write"] * p[3]) / 1e6
+    return total
+
 
 def main(questions):
     llm = LLMClient()
@@ -25,6 +43,7 @@ def main(questions):
     for question in questions:
         print("\n" + "=" * 78 + "\nQ: %s" % question)
         started = time.time()
+        spent_before = cost_usd(llm.usage)
         answer = []
         for event in answer_question(llm, index, question, history):
             elapsed = time.time() - started
@@ -44,6 +63,10 @@ def main(questions):
                 print("  [%5.1fs] %s: %s" % (elapsed, kind.upper(), event["text"]))
         text = "".join(answer).strip()
         print("  [%5.1fs] A: %s" % (time.time() - started, text))
+        spent = cost_usd(llm.usage) - spent_before
+        print("  cost: $%.4f  (%s)" % (spent, "; ".join(
+            "%s in=%d out=%d cached=%d" % (m.split("-")[1], u["input"], u["output"], u["cache_read"])
+            for m, u in llm.usage.items())))
         history.append({"role": "user", "content": question})
         history.append({"role": "assistant", "content": text})
 

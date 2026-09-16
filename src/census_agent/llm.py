@@ -51,6 +51,19 @@ class LLMClient(object):
         import anthropic
         self._anthropic = anthropic
         self._client = anthropic.Anthropic(api_key=api_key or config.anthropic_api_key())
+        # Token usage per model since construction, for cost reporting.
+        self.usage = {}  # type: Dict[str, Dict[str, int]]
+
+    def _record_usage(self, model, response):
+        # type: (str, Any) -> None
+        u = getattr(response, "usage", None)
+        if u is None:
+            return
+        tally = self.usage.setdefault(model, {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0})
+        tally["input"] += getattr(u, "input_tokens", 0) or 0
+        tally["output"] += getattr(u, "output_tokens", 0) or 0
+        tally["cache_read"] += getattr(u, "cache_read_input_tokens", 0) or 0
+        tally["cache_write"] += getattr(u, "cache_creation_input_tokens", 0) or 0
 
     # --- internals ----------------------------------------------------------
 
@@ -106,7 +119,9 @@ class LLMClient(object):
         # type: (Any) -> Any
         a = self._anthropic
         try:
-            return self._client.messages.create(**kwargs)
+            response = self._client.messages.create(**kwargs)
+            self._record_usage(kwargs.get("model", "?"), response)
+            return response
         except a.RateLimitError as exc:
             raise LLMUnavailable(
                 "The assistant is rate limited right now. Please retry in a moment."
@@ -165,7 +180,9 @@ class LLMClient(object):
             ) as stream:
                 for text in stream.text_stream:
                     yield text
-                self._check_refusal(stream.get_final_message())
+                final = stream.get_final_message()
+                self._record_usage(model, final)
+                self._check_refusal(final)
         except a.APIStatusError as exc:
             log.exception("Anthropic streaming error")
             raise LLMUnavailable(describe_status_error(exc.status_code)) from exc
