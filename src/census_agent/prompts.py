@@ -126,6 +126,9 @@ Rules for the SQL:
 - Prefer explicit aggregation (SUM, AVG, COUNT) over returning raw block-group
   rows when the question is about a county or state. Return block-group rows
   only when the user asks for them, and then ORDER BY something meaningful.
+- For "highest", "lowest", "most", "least", or "top N" questions, always
+  include an explicit ORDER BY on the measure (DESC or ASC) and a LIMIT of
+  the requested size (LIMIT 1 for a single answer).
 - Do not sum an estimate column with its margin of error.
 
 Set `answerable: false` when:

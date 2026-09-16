@@ -67,10 +67,10 @@ WIDE_CANDIDATES_PER_GROUP = int(_get("WIDE_CANDIDATES_PER_GROUP", "8"))
 MAX_SCHEMA_CANDIDATES = int(_get("MAX_SCHEMA_CANDIDATES", "20"))
 # Diversity cap: no single ACS table may fill more than this many slots.
 MAX_CANDIDATES_PER_GROUP = int(_get("MAX_CANDIDATES_PER_GROUP", "5"))
-# Messages of history shown to the gate for follow-up resolution (8 = four
+# Messages of history shown to the gate for follow-up resolution (12 = six
 # exchanges). Longer helps deep conversations; shorter is cheaper and keeps
 # a stale topic from leaking into a new question.
-MAX_HISTORY_TURNS = int(_get("MAX_HISTORY_TURNS", "8"))
+MAX_HISTORY_TURNS = int(_get("MAX_HISTORY_TURNS", "12"))
 
 SCHEMA_INDEX_PATH = _get("SCHEMA_INDEX_PATH", "schema_index.json")
 
