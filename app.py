@@ -126,6 +126,38 @@ def run_turn(llm, index, question, history):
     }
 
 
+def render_sidebar(index):
+    """Scope and limits, so a reviewer knows what to expect before typing."""
+    with st.sidebar:
+        st.markdown("### About this agent")
+        st.markdown(
+            "Each question is turned into one read-only SQL query against the "
+            "Census data in Snowflake, and the answer is written from the rows "
+            "that came back -- never from memory. The SQL and the rows are "
+            "shown under every answer."
+        )
+        st.markdown("**Covers**")
+        st.markdown(
+            "- ACS 5-year estimates, **2020** (default) and 2019\n"
+            "- 2020 decennial census counts\n"
+            "- %d variables: age, sex, race, income, poverty, employment, "
+            "education, housing, rent, commuting, language, households, "
+            "veterans, insurance, internet\n"
+            "- Any US state, county, or census block group" % len(index)
+        )
+        st.markdown("**Good to know**")
+        st.markdown(
+            "- Cities are approximated by their county (Brooklyn = Kings County) "
+            "and the answer says so\n"
+            "- County medians are weighted averages of block-group medians\n"
+            "- No ZIP codes or neighbourhood boundaries; no years other than 2019/2020\n"
+            "- Follow-ups work (\"what about Queens?\"); history lasts for this tab"
+        )
+        if st.button("New conversation", use_container_width=True):
+            st.session_state.messages = []
+            st.rerun()
+
+
 def main():
     st.title("📊 US Census Agent")
     st.caption(
@@ -135,6 +167,7 @@ def main():
     )
 
     llm, index = boot()
+    render_sidebar(index)
 
     if "messages" not in st.session_state:
         st.session_state.messages = []
