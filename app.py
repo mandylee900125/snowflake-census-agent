@@ -55,10 +55,20 @@ def boot():
     return llm, index
 
 
+def md(text):
+    """Render model text as markdown without Streamlit's LaTeX surprise.
+
+    st.markdown treats "$74,600 ... $74,621" as an inline formula and typesets
+    everything between the two dollar signs as math. Census answers are full
+    of dollar amounts, so escape every $ before rendering.
+    """
+    return text.replace("$", "\\$")
+
+
 def render_turn(turn):
     """Re-render a stored turn on Streamlit's rerun."""
     with st.chat_message(turn["role"]):
-        st.markdown(turn["content"])
+        st.markdown(md(turn["content"]))
         if turn.get("sql"):
             with st.expander("SQL"):
                 st.code(turn["sql"], language="sql")
@@ -96,10 +106,10 @@ def run_turn(llm, index, question, history):
                     )
             elif kind == "token":
                 answer.append(event["text"])
-                answer_slot.markdown("".join(answer))
+                answer_slot.markdown(md("".join(answer)))
             elif kind == "message":
                 answer.append(event["text"])
-                answer_slot.markdown(event["text"])
+                answer_slot.markdown(md(event["text"]))
             elif kind == "error":
                 answer.append(event["text"])
                 answer_slot.warning(event["text"])
@@ -147,7 +157,7 @@ def main():
         return
 
     with st.chat_message("user"):
-        st.markdown(question)
+        st.markdown(md(question))
 
     history = list(st.session_state.messages)
     st.session_state.messages.append({"role": "user", "content": question})
