@@ -126,9 +126,10 @@ class LLMClient(object):
         when the deadline leaves room for it."""
         if timeout is None:
             return self._client.messages
+        # No retries under a deadline: a retry after a timeout would let one
+        # call take twice its share of the turn.
         timeout = max(1.0, float(timeout))
-        retries = 1 if timeout >= 2 * config.MIN_LLM_CALL_SECONDS else 0
-        return self._client.with_options(timeout=timeout, max_retries=retries).messages
+        return self._client.with_options(timeout=timeout, max_retries=0).messages
 
     def _call(self, timeout=None, **kwargs):
         # type: (Optional[float], Any) -> Any

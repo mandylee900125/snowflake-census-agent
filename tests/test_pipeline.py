@@ -324,15 +324,43 @@ class TestSearchMissVersusDataGap:
 
 
 class TestDeadlineReachesEveryModelCall:
-    def test_each_model_call_gets_the_remaining_budget(self, index, stub_query, monkeypatch):
+    """Three slow stages must not add up past the budget. The clock below
+    is what the pipeline reads; each stage sees only what is left."""
+
+    def test_each_call_is_given_only_the_remaining_budget(self, index, stub_query, monkeypatch):
         from census_agent import config
         stub_query(["N"], [(1,)])
-        TestLatencyBudget._clock(monkeypatch, [0.0, 0.0, 10.0, 10.0, 20.0, 30.0])
+        # readings: start, gate call, SQL call, query timeout, answer call, per-token checks
+        TestLatencyBudget._clock(monkeypatch, [0.0, 0.0, 20.0, 40.0, 40.0, 40.0, 40.0, 40.0, 40.0, 40.0])
         llm = FakeLLM([on_topic(), sql_plan("SELECT 1 FROM t")])
         collect(pipeline.answer_question(llm, index, "q"))
-        # FakeLLM records nothing about timeouts; assert through the real client wrapper instead.
+        gate, sql, answer = llm.timeouts
+        assert gate == config.TURN_BUDGET_SECONDS
+        assert sql == config.TURN_BUDGET_SECONDS - 20 - config.ANSWER_RESERVE_SECONDS
+        assert answer == config.TURN_BUDGET_SECONDS - 40
+        assert all(t > 0 for t in llm.timeouts)
+
+    def test_answer_stream_is_cut_when_the_deadline_passes(self, index, stub_query, monkeypatch):
+        stub_query(["N"], [(1,)])
+        # Two tokens arrive before the deadline, then the clock jumps past it.
+        TestLatencyBudget._clock(monkeypatch, [0.0, 0.0, 5.0, 5.0, 5.0, 6.0, 7.0, 99.0])
+        llm = FakeLLM([on_topic(), sql_plan("SELECT 1 FROM t")],
+                      stream_text="one two three four five six")
+        out = collect(pipeline.answer_question(llm, index, "q"))
+        text = "".join(out["token"])
+        assert "cut short" in text and "six" not in text
+
+    def test_summary_is_skipped_when_no_time_is_left(self, index, stub_query, monkeypatch):
+        stub_query(["N"], [(1,)])
+        TestLatencyBudget._clock(monkeypatch, [0.0, 0.0, 10.0, 10.0, 54.0])
+        llm = FakeLLM([on_topic(), sql_plan("SELECT 1 FROM t")])
+        out = collect(pipeline.answer_question(llm, index, "q"))
+        assert out["data"] is not None
+        assert out["message"] and "ran out of time" in out["message"][0]
+        assert len(llm.timeouts) == 2   # the answer call was never made
+
+    def test_no_retries_under_a_deadline(self):
         from census_agent.llm import LLMClient
         client = LLMClient(api_key="test-key")
         assert client._messages(None) is client._client.messages
-        short = client._messages(5.0)
-        assert short is not client._client.messages           # a per-call override was made
+        assert client._messages(5.0) is not client._client.messages

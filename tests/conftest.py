@@ -20,9 +20,11 @@ class FakeLLM(object):
         self.structured_responses = list(structured_responses or [])
         self._stream_text = stream_text
         self.calls = []
+        self.timeouts = []  # the deadline each call was given, in order
 
     def structured(self, system, user, schema, model=None, max_tokens=None, effort=None, timeout=None):
         self.calls.append({"system": system, "user": user, "model": model})
+        self.timeouts.append(timeout)
         if not self.structured_responses:
             raise AssertionError("FakeLLM ran out of scripted structured responses")
         response = self.structured_responses.pop(0)
@@ -32,6 +34,7 @@ class FakeLLM(object):
 
     def stream_text(self, system, messages, model=None, max_tokens=None, effort=None, timeout=None):
         self.calls.append({"system": system, "messages": messages, "model": model})
+        self.timeouts.append(timeout)
         for word in self._stream_text.split():
             yield word + " "
 

@@ -156,3 +156,47 @@ class TestFindingsFromExternalReview:
         with pytest.raises(UnsafeSQL):
             validate_sql("SELECT 1 /* harmless */; DROP TABLE x")
         assert "-- note" in validate_sql("SELECT 1 -- note\nLIMIT 1")
+
+
+
+class TestScopeIsTheCensusDatabase:
+    """A read-only role is not a confined one. On the real account the role
+    could still read SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY (other queries'
+    text) and the sample database, via PUBLIC. The validator closes that."""
+
+    def test_account_usage_is_refused(self):
+        from census_agent.guardrails import UnsafeSQL, validate_sql
+        with pytest.raises(UnsafeSQL, match="account-metadata"):
+            validate_sql("SELECT query_text FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY LIMIT 5")
+
+    def test_information_schema_is_refused(self):
+        from census_agent.guardrails import UnsafeSQL, validate_sql
+        with pytest.raises(UnsafeSQL, match="account-metadata"):
+            validate_sql("SELECT table_name FROM information_schema.tables LIMIT 5")
+
+    def test_other_database_is_refused(self, monkeypatch):
+        from census_agent import config
+        from census_agent.guardrails import UnsafeSQL, validate_sql
+        monkeypatch.setenv("SNOWFLAKE_DATABASE", "CENSUS_DB")
+        with pytest.raises(UnsafeSQL):
+            validate_sql("SELECT * FROM SNOWFLAKE_SAMPLE_DATA.TPCH_SF1.NATION LIMIT 5")
+        with pytest.raises(UnsafeSQL, match="only CENSUS_DB"):
+            validate_sql('SELECT * FROM "OtherDb".PUBLIC."2020_CBG_B01" LIMIT 5')
+        with pytest.raises(UnsafeSQL, match="only CENSUS_DB"):
+            validate_sql("SELECT * FROM snowflake_learning_db.public.t LIMIT 5")
+
+    def test_fully_qualified_census_names_are_fine(self, monkeypatch):
+        from census_agent.guardrails import validate_sql
+        monkeypatch.setenv("SNOWFLAKE_DATABASE", "CENSUS_DB")
+        assert validate_sql('SELECT 1 FROM CENSUS_DB.PUBLIC."2020_CBG_B01" LIMIT 1')
+        assert validate_sql('SELECT 1 FROM "CENSUS_DB"."PUBLIC"."2020_CBG_B01" LIMIT 1')
+        assert validate_sql('SELECT 1 FROM census_db.public."2020_CBG_B01" LIMIT 1')
+
+    def test_unqualified_and_two_part_names_are_fine(self):
+        from census_agent.guardrails import validate_sql
+        assert validate_sql('SELECT b."B01003e1" FROM "2020_CBG_B01" b LIMIT 1')
+        assert validate_sql('SELECT 1 FROM PUBLIC."2020_CBG_B01" LIMIT 1')
+
+    def test_a_column_alias_with_dots_in_a_string_is_not_a_reference(self):
+        from census_agent.guardrails import validate_sql
+        assert validate_sql("SELECT 'a.b.c' AS label FROM \"2020_CBG_B01\" LIMIT 1")

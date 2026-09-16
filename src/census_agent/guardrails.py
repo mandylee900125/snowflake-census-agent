@@ -31,6 +31,25 @@ _LIMIT_CLAUSE = re.compile(r"\bLIMIT\s+(\d+)\b", re.IGNORECASE)
 # callable from a plain SELECT, so a keyword denylist alone does not stop them.
 _SYSTEM_FUNCTION = re.compile(r"\bSYSTEM\$", re.IGNORECASE)
 
+# A read-only role is not a confined one. Verified on the real account: under
+# CENSUS_READER the session could still SELECT from
+# SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY (other people's query text) and the
+# sample database, because every role inherits PUBLIC. So the validator pins
+# every fully-qualified name to the configured database and refuses the
+# account-metadata schemas outright. Unqualified names resolve to the session
+# database, which the connection sets.
+FORBIDDEN_SCHEMAS = frozenset([
+    "INFORMATION_SCHEMA", "ACCOUNT_USAGE", "READER_ACCOUNT_USAGE",
+    "ORGANIZATION_USAGE", "DATA_SHARING_USAGE", "SNOWFLAKE_SAMPLE_DATA",
+])
+# db.schema.object -- identifiers may be quoted; the view has literal
+# contents blanked but keeps the quote characters, so quoted names survive.
+_THREE_PART = re.compile(
+    r'(?:"([^"]*)"|([A-Za-z_][A-Za-z0-9_$]*))\s*\.\s*'
+    r'(?:"([^"]*)"|([A-Za-z_][A-Za-z0-9_$]*))\s*\.\s*'
+    r'(?:"([^"]*)"|([A-Za-z_][A-Za-z0-9_$]*))'
+)
+
 
 class UnsafeSQL(ValueError):
     """The generated SQL is not a safe read-only query."""
@@ -82,6 +101,9 @@ def validate_sql(sql, max_rows=None):
       * it is a SELECT (or a WITH ... SELECT)
       * it contains no data-modifying or session-modifying keyword, and no
         SYSTEM$ administrative function
+      * every fully-qualified name is in the configured database, and no
+        account-metadata schema (ACCOUNT_USAGE, INFORMATION_SCHEMA, ...) is
+        referenced
       * its outermost query has a LIMIT no larger than max_rows
 
     The returned SQL is the model's text with only a trailing semicolon
@@ -114,8 +136,28 @@ def validate_sql(sql, max_rows=None):
         raise UnsafeSQL("Query contains disallowed keyword(s): %s." % ", ".join(banned))
     if _SYSTEM_FUNCTION.search(view):
         raise UnsafeSQL("Query calls a SYSTEM$ administrative function.")
+    _check_scope(body, view)
 
     return _enforce_limit(body, view, max_rows)
+
+
+def _check_scope(sql, view):
+    # type: (str, str) -> None
+    """Every db.schema.object reference must name the configured database,
+    and no reference may touch an account-metadata schema."""
+    if words_in(view) & FORBIDDEN_SCHEMAS:
+        raise UnsafeSQL("Query references an account-metadata schema; only the Census data is allowed.")
+    allowed = (config._get("SNOWFLAKE_DATABASE") or "").upper()
+    for m in _THREE_PART.finditer(view):
+        # Masked view has blanked quoted names; read them from the original.
+        db = (sql[m.start(1):m.end(1)] if m.group(1) is not None else m.group(2)).upper()
+        if allowed and db != allowed:
+            raise UnsafeSQL("Query references database %s; only %s is allowed." % (db, allowed))
+
+
+def words_in(view):
+    # type: (str) -> set
+    return set(re.findall(r"[A-Za-z_][A-Za-z0-9_$]*", view.upper()))
 
 
 def _enforce_limit(sql, view, max_rows):

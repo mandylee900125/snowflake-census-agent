@@ -212,6 +212,11 @@ def answer_question(llm, index, question, history=None):
             effort=config.SQL_EFFORT,
             timeout=_remaining(started),
         ):
+            if _remaining(started) <= 0:
+                # A streaming timeout bounds the gap between tokens, not the
+                # total; this is what actually stops the turn at the deadline.
+                yield _event("token", text=" … (answer cut short to stay within the time limit)")
+                break
             yield _event("token", text=token)
     except LLMUnavailable as exc:
         yield _event("error", text=(
