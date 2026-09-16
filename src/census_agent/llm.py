@@ -50,7 +50,11 @@ class LLMClient(object):
         # type: (Optional[str]) -> None
         import anthropic
         self._anthropic = anthropic
-        self._client = anthropic.Anthropic(api_key=api_key or config.anthropic_api_key())
+        self._client = anthropic.Anthropic(
+            api_key=api_key or config.anthropic_api_key(),
+            timeout=float(config.LLM_TIMEOUT_SECONDS),
+            max_retries=1,
+        )
         # Token usage per model since construction, for cost reporting.
         self.usage = {}  # type: Dict[str, Dict[str, int]]
 
@@ -126,6 +130,10 @@ class LLMClient(object):
             raise LLMUnavailable(
                 "The assistant is rate limited right now. Please retry in a moment."
             ) from exc
+        except a.APITimeoutError as exc:
+            raise LLMUnavailable(
+                "The language model took too long to respond. Please try again."
+            ) from exc
         except a.APIConnectionError as exc:
             raise LLMUnavailable(
                 "Could not reach the language model service. Check network connectivity."
@@ -186,5 +194,9 @@ class LLMClient(object):
         except a.APIStatusError as exc:
             log.exception("Anthropic streaming error")
             raise LLMUnavailable(describe_status_error(exc.status_code)) from exc
+        except a.APITimeoutError as exc:
+            raise LLMUnavailable(
+                "The language model took too long to respond. Please try again."
+            ) from exc
         except a.APIConnectionError as exc:
             raise LLMUnavailable("Could not reach the language model service.") from exc

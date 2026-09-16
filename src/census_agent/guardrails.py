@@ -27,6 +27,9 @@ _BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
 _SINGLE_QUOTED = re.compile(r"'(?:[^']|'')*'")
 _DOUBLE_QUOTED = re.compile(r'"(?:[^"]|"")*"')
 _LIMIT_CLAUSE = re.compile(r"\bLIMIT\s+(\d+)\b", re.IGNORECASE)
+# SYSTEM$ABORT_SESSION, SYSTEM$CANCEL_ALL_QUERIES, ... are administrative but
+# callable from a plain SELECT, so a keyword denylist alone does not stop them.
+_SYSTEM_FUNCTION = re.compile(r"\bSYSTEM\$", re.IGNORECASE)
 
 
 class UnsafeSQL(ValueError):
@@ -58,7 +61,8 @@ def validate_sql(sql, max_rows=None):
     Guarantees on the returned string:
       * exactly one statement
       * it is a SELECT (or a WITH ... SELECT)
-      * it contains no data-modifying or session-modifying keyword
+      * it contains no data-modifying or session-modifying keyword, and no
+        SYSTEM$ administrative function
       * it has a LIMIT no larger than max_rows
     """
     max_rows = max_rows or config.MAX_ROWS
@@ -89,6 +93,8 @@ def validate_sql(sql, max_rows=None):
     banned = sorted(words & FORBIDDEN_KEYWORDS)
     if banned:
         raise UnsafeSQL("Query contains disallowed keyword(s): %s." % ", ".join(banned))
+    if _SYSTEM_FUNCTION.search(masked_body):
+        raise UnsafeSQL("Query calls a SYSTEM$ administrative function.")
 
     return _enforce_limit(body, max_rows)
 

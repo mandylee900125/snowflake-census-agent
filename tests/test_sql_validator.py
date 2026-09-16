@@ -99,3 +99,23 @@ class TestDegenerateInput:
     def test_comment_only_is_rejected(self):
         with pytest.raises(UnsafeSQL):
             validate_sql("-- just a comment")
+
+
+class TestAdministrativeFunctions:
+    """A SELECT can still be dangerous: SYSTEM$ functions are administrative.
+
+    Found by probing the real account: SELECT SYSTEM$CANCEL_ALL_QUERIES(...)
+    passed the keyword denylist and executed.
+    """
+
+    def test_system_functions_are_rejected(self):
+        from census_agent.guardrails import UnsafeSQL, validate_sql
+        for sql in ("SELECT SYSTEM$CANCEL_ALL_QUERIES(123)",
+                    "select system$abort_session(1) from t",
+                    "WITH x AS (SELECT SYSTEM$ABORT_SESSION(1) AS y) SELECT * FROM x"):
+            with pytest.raises(UnsafeSQL, match="SYSTEM"):
+                validate_sql(sql)
+
+    def test_system_inside_a_quoted_identifier_is_fine(self):
+        from census_agent.guardrails import validate_sql
+        assert validate_sql('SELECT "SYSTEM$-like label" FROM t LIMIT 5')

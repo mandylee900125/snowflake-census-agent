@@ -46,6 +46,18 @@ SQL_EFFORT = _get("SQL_EFFORT", "medium")
 # --- Safety limits ----------------------------------------------------------
 MAX_ROWS = int(_get("MAX_ROWS", "500"))
 QUERY_TIMEOUT_SECONDS = int(_get("QUERY_TIMEOUT_SECONDS", "30"))
+
+# --- Latency budget ---------------------------------------------------------
+# The brief fails any turn over 60s. Budget the whole turn, keep time back
+# for the streamed answer, and never start a repair attempt (another model
+# call plus another query) that cannot finish inside the budget.
+TURN_BUDGET_SECONDS = int(_get("TURN_BUDGET_SECONDS", "55"))
+ANSWER_RESERVE_SECONDS = int(_get("ANSWER_RESERVE_SECONDS", "10"))
+MIN_QUERY_TIMEOUT_SECONDS = 5
+REPAIR_CUTOFF_SECONDS = int(_get("REPAIR_CUTOFF_SECONDS", "30"))
+# A hung model call must fail the turn, not the reviewer's patience. The SDK
+# retries once on timeouts and 5xx, so the worst case is ~2x this.
+LLM_TIMEOUT_SECONDS = int(_get("LLM_TIMEOUT_SECONDS", "30"))
 MAX_SCHEMA_CANDIDATES = int(_get("MAX_SCHEMA_CANDIDATES", "20"))
 # Diversity cap: no single ACS table may fill more than this many slots.
 MAX_CANDIDATES_PER_GROUP = int(_get("MAX_CANDIDATES_PER_GROUP", "5"))

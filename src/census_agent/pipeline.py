@@ -8,6 +8,7 @@ work happens. Each stage can end the turn early with a plain-language message
               -> validate -> execute -> (repair once) -> answer
 """
 import logging
+import time
 from typing import Any, Dict, Iterator, List, Optional
 
 from . import config, guardrails, prompts, snowflake_client
@@ -45,6 +46,15 @@ def _generate_sql(llm, question, schema_context, previous_error=None):
     )
 
 
+def _query_timeout(started):
+    # type: (float) -> int
+    """Seconds a Snowflake query may take, given what the turn has spent."""
+    remaining = (config.TURN_BUDGET_SECONDS - (time.monotonic() - started)
+                 - config.ANSWER_RESERVE_SECONDS)
+    return int(max(config.MIN_QUERY_TIMEOUT_SECONDS,
+                   min(config.QUERY_TIMEOUT_SECONDS, remaining)))
+
+
 def _explain_unanswerable(plan):
     # type: (Dict[str, Any]) -> str
     parts = [plan.get("explanation") or "I can't answer that from this dataset."]
@@ -57,6 +67,7 @@ def answer_question(llm, index, question, history=None):
     # type: (Any, SchemaIndex, str, Optional[List[dict]]) -> Iterator[Dict[str, Any]]
     """Run one turn. Yields status / sql / data / token / message / error events."""
     history = history or []
+    started = time.monotonic()
 
     # 1. Fast-fail gate, before any expensive work.
     yield _event("status", text="Checking the question")
@@ -89,8 +100,15 @@ def answer_question(llm, index, question, history=None):
     rows = None  # type: Optional[List[tuple]]
     plan = {}  # type: Dict[str, Any]
     safe_sql = None  # type: Optional[str]
+    out_of_time = False
 
     for attempt in range(MAX_SQL_ATTEMPTS):
+        if attempt > 0 and time.monotonic() - started > config.REPAIR_CUTOFF_SECONDS:
+            # A repair is another model call plus another query. Past this
+            # point it would blow the 60s budget; explaining beats hanging.
+            log.warning("Skipping SQL repair: %.0fs already elapsed", time.monotonic() - started)
+            out_of_time = True
+            break
         yield _event("status", text="Writing SQL" if attempt == 0 else "Fixing the query")
         try:
             plan = _generate_sql(llm, standalone, schema_context, last_error)
@@ -112,7 +130,9 @@ def answer_question(llm, index, question, history=None):
         yield _event("sql", sql=safe_sql)
         yield _event("status", text="Querying Snowflake")
         try:
-            columns, rows = snowflake_client.run_select(safe_sql)
+            columns, rows = snowflake_client.run_select(
+                safe_sql, timeout_seconds=_query_timeout(started)
+            )
             break
         except snowflake_client.SnowflakeUnavailable as exc:
             log.exception("Snowflake unavailable")
@@ -128,10 +148,12 @@ def answer_question(llm, index, question, history=None):
             continue
 
     if rows is None:
-        yield _event("message", text=(
-            "I understood the question but couldn't build a working query for "
-            "it against this dataset. The last problem was: %s" % (last_error or "unknown")
-        ))
+        text = ("I understood the question but couldn't build a working query for "
+                "it against this dataset. The last problem was: %s" % (last_error or "unknown"))
+        if out_of_time:
+            text += (" I stopped retrying to stay within the time limit -- please "
+                     "try again, or rephrase the question.")
+        yield _event("message", text=text)
         return
 
     yield _event("data", columns=columns, rows=rows)

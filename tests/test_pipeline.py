@@ -218,3 +218,71 @@ class TestErrorMessages:
     def test_unknown_status_still_reports_the_code(self):
         from census_agent.llm import describe_status_error
         assert "418" in describe_status_error(418)
+
+
+class TestLatencyBudget:
+    """The brief fails any turn over 60s, so the pipeline must not gamble on
+    a repair attempt it cannot finish, and must shrink the query timeout as
+    the turn ages."""
+
+    @staticmethod
+    def _clock(monkeypatch, readings):
+        import types
+        it = iter(readings)
+        last = {"t": readings[0]}
+
+        def monotonic():
+            try:
+                last["t"] = next(it)
+            except StopIteration:
+                pass
+            return last["t"]
+        monkeypatch.setattr(pipeline, "time", types.SimpleNamespace(monotonic=monotonic))
+
+    def test_repair_is_skipped_when_the_turn_is_already_slow(self, index, stub_query, monkeypatch):
+        # readings: turn start, query-timeout calc, repair check (40s in)
+        self._clock(monkeypatch, [0.0, 0.0, 40.0])
+        stub_query(error=snowflake_client.QueryFailed("SQL compilation error"))
+        # One plan only: a repair would ask the fake for a second and fail loudly.
+        llm = FakeLLM([on_topic(), sql_plan("SELECT 1 FROM t")])
+        out = collect(pipeline.answer_question(llm, index, "median income?"))
+        assert llm.structured_responses == []
+        assert out["message"] and "time limit" in out["message"][0]
+        assert not out["error"]
+
+    def test_repair_still_happens_when_there_is_time(self, index, stub_query, monkeypatch):
+        self._clock(monkeypatch, [0.0, 0.0, 12.0, 12.0])
+        stub_query(error=snowflake_client.QueryFailed("SQL compilation error"))
+        llm = FakeLLM([on_topic(), sql_plan("SELECT 1 FROM t"), sql_plan("SELECT 2 FROM t")])
+        collect(pipeline.answer_question(llm, index, "median income?"))
+        assert llm.structured_responses == []  # both plans consumed: repair ran
+
+    def test_query_timeout_shrinks_with_the_remaining_budget(self, index, monkeypatch):
+        from census_agent import config
+        seen = []
+
+        def fake(sql, max_rows=None, timeout_seconds=None):
+            seen.append(timeout_seconds)
+            return ["N"], [(1,)]
+        monkeypatch.setattr(snowflake_client, "run_select", fake)
+
+        self._clock(monkeypatch, [0.0, 0.0])
+        collect(pipeline.answer_question(FakeLLM([on_topic(), sql_plan("SELECT 1 FROM t")]), index, "q"))
+        self._clock(monkeypatch, [0.0, 43.0])
+        collect(pipeline.answer_question(FakeLLM([on_topic(), sql_plan("SELECT 1 FROM t")]), index, "q"))
+        assert seen == [config.QUERY_TIMEOUT_SECONDS, config.MIN_QUERY_TIMEOUT_SECONDS]
+
+
+class TestModelTimeout:
+    def test_timeout_is_reported_as_slow_not_as_a_network_problem(self, monkeypatch):
+        import anthropic
+        from census_agent.llm import LLMClient, LLMUnavailable
+        client = LLMClient(api_key="test-key")
+        # Instantiate without __init__: the real constructor wants an HTTP request object.
+        exc = anthropic.APITimeoutError.__new__(anthropic.APITimeoutError)
+
+        def boom(**kwargs):
+            raise exc
+        monkeypatch.setattr(client._client.messages, "create", boom)
+        with pytest.raises(LLMUnavailable, match="too long"):
+            client.structured(system="s", user="u", schema={"type": "object"}, model="claude-haiku-4-5")

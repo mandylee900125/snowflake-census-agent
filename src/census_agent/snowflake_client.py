@@ -24,6 +24,8 @@ def get_connection():
 
     Streamlit reruns the whole script on every interaction, so opening a
     connection per turn would add seconds of handshake to each question.
+    A cursor is created per call: the connector documents connections as
+    shareable between threads and cursors as not.
     """
     global _connection
     if _connection is not None and not _connection.is_closed():
@@ -36,6 +38,9 @@ def get_connection():
     try:
         _connection = snowflake.connector.connect(
             client_session_keep_alive=True,
+            # Session-wide ceiling. The per-statement timeout in run_select
+            # is tighter; this catches anything that bypasses it.
+            session_parameters={"STATEMENT_TIMEOUT_IN_SECONDS": config.QUERY_TIMEOUT_SECONDS},
             **config.snowflake_params()
         )
     except Exception as exc:
@@ -43,6 +48,27 @@ def get_connection():
             "Could not connect to Snowflake: %s" % exc
         ) from exc
     return _connection
+
+
+def _is_query_error(exc):
+    # type: (Exception) -> bool
+    """True if Snowflake rejected the SQL itself.
+
+    Compile errors, bad identifiers and statement timeouts all arrive as
+    ProgrammingError -- the model can be asked to fix those. Session and
+    authentication failures use the same class but a 390xxx error code, and
+    everything else (OperationalError, InterfaceError, socket errors) is the
+    connection or the service. None of those must be fed back to the model
+    as if it had written bad SQL.
+    """
+    try:
+        from snowflake.connector import errors
+    except ImportError:  # pragma: no cover
+        return True
+    if not isinstance(exc, errors.ProgrammingError):
+        return False
+    errno = getattr(exc, "errno", None) or 0
+    return not (390000 <= errno < 391000)
 
 
 def run_select(
@@ -53,24 +79,35 @@ def run_select(
     """Execute a read-only query. Returns (column_names, rows).
 
     Callers must have already passed `sql` through guardrails.validate_sql.
+    Raises QueryFailed when the SQL is at fault, SnowflakeUnavailable when
+    the connection or service is; the pipeline treats those differently.
     """
+    global _connection
     max_rows = max_rows or config.MAX_ROWS
     timeout_seconds = timeout_seconds or config.QUERY_TIMEOUT_SECONDS
 
     conn = get_connection()
     cursor = conn.cursor()
     try:
-        # Belt-and-braces: even if the validator missed something, the session
-        # itself refuses to write and will not run past the timeout.
-        cursor.execute("ALTER SESSION SET STATEMENT_TIMEOUT_IN_SECONDS = %d" % timeout_seconds)
-        cursor.execute(sql)
+        # Per-statement, client-enforced: the connector cancels the query in
+        # Snowflake when it expires, so one slow query cannot eat the turn.
+        cursor.execute(sql, timeout=timeout_seconds)
         columns = [c[0] for c in cursor.description]
         rows = cursor.fetchmany(max_rows)
         return columns, rows
     except Exception as exc:
-        raise QueryFailed(str(exc)) from exc
+        if _is_query_error(exc):
+            raise QueryFailed(str(exc)) from exc
+        # Drop the connection so the next call reconnects instead of reusing
+        # a dead socket, and tell the caller this was the service, not the SQL.
+        log.exception("Snowflake connection or service error")
+        _connection = None
+        raise SnowflakeUnavailable("Lost the connection to Snowflake: %s" % exc) from exc
     finally:
-        cursor.close()
+        try:
+            cursor.close()
+        except Exception:  # pragma: no cover - already failing
+            pass
 
 
 def list_columns() -> List[Dict[str, str]]:
