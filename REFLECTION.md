@@ -1,144 +1,135 @@
 # Reflection
 
-> Skeleton written at the start so it accumulates honestly instead of being
-> reconstructed at hour 23. **Fill the `TODO` markers before submitting** —
-> and cut anything that didn't actually happen.
+Written at the end of the 24 hours. It covers the four things the brief
+asked for: how it was built and the decisions that mattered, what I'd do
+with more time, edge cases found but not fully fixed, and testing.
 
-## Development process
+---
 
-I read the brief twice before writing code and spent the first hour on the
-Snowflake trial and `scripts/explore_schema.py` — looking at what the share
-actually contains rather than what I assumed. That was the right call: seeing
-that most columns are ACS codes (`B19013e1`) with meanings in a separate
-metadata table changed the design. Retrieval over column *names* would have
-failed almost every question.
+## 1. How it was built, and the decisions that mattered
 
-I kept `DECISIONS.md` as I went rather than reconstructing rationale
-afterwards. It's the honest record of what I chose and what I rejected.
+**The problem.** The Census dataset has more than 17,000 columns with coded
+names such as `B19013e1`. Sending the entire schema to the AI for every
+question would be noisy and inefficient, so the main problem was finding a
+small set of relevant columns before asking Claude to write SQL.
 
-_TODO: how you actually used AI coding tools — what you delegated, what you
-had to correct, where you disagreed with the generated code. They ask about
-this directly in the review._
+**How I built it.** I first explored the real Snowflake data to understand
+how the Census tables and metadata were structured. That showed me that my
+initial assumptions about the data were not completely correct, so the
+retrieval approach had to be adapted to the real schema.
 
-## Key architectural decisions
+The app then follows a simple pipeline:
 
-Full log in [DECISIONS.md](DECISIONS.md). The three that mattered most:
+```
+user question → gate → schema search → Claude writes SQL → SQL safety check
+             → Snowflake runs the query → Claude explains the result
+```
 
-1. **Retrieval over the schema instead of a hard-coded column subset.** ~7,500
-   columns can't go in a prompt. Hard-coding a subset passes a demo and fails
-   everything else. This is why the agent handles questions I never
-   anticipated.
+Claude Code did most of the implementation. My role was setting up Snowflake
+and the deployment, testing the system against the real data, reviewing the
+proposed decisions, asking for problems to be audited, and deciding which
+trade-offs to accept.
 
-2. **Two independent guardrails.** The topic gate is an LLM call and is
-   defeasible; the SQL validator is deterministic Python that never consults
-   the model. A fully prompt-injected model still cannot reach a write.
+**The decisions that mattered.**
 
-3. **Time bought where the brief grades.** I spent it on retrieval, failure
-   handling, and tests, and deliberately not on UI. Streamlit's default chat
-   look is plain — that was the trade.
+1. **Search the full schema instead of hard-coding columns.** The app builds
+   a searchable index from the Census metadata. For each question, it
+   retrieves roughly 20 relevant columns and gives those to Claude. This lets
+   the app work across the full dataset instead of only supporting a few
+   demo questions.
 
-## Where I invested, and what I deliberately left out
+2. **Search table first, then column.** A flat search sometimes returned too
+   many columns from one Census table. The search was changed to first
+   identify relevant tables and then relevant columns within those tables,
+   with a cap on how many results can come from one table.
 
-**Invested:** the schema retrieval layer, the SQL validator, graceful
-degradation paths, and the test suite.
+3. **Use BM25 keyword search instead of embeddings for the first version.**
+   Census metadata uses fairly specific terminology, so keyword search was
+   fast, simple, and easy to inspect. The first AI step can also add
+   vocabulary hints such as mapping "women" to "Female." I would consider
+   adding embeddings later for questions that use very different wording.
 
-**Left out on purpose:**
-- **Authentication.** Not required, and it would have cost an hour that
-  retrieval needed.
-- **Visualisation of results.** A raw table is honest and took minutes; charts
-  would have been demo polish over correctness.
-- **Query result caching.** Real cost saving in production, no effect on what's
-  being evaluated.
-- **Embedding-based retrieval.** See the known limits below — this is the first
-  thing I'd add, not something I think was unnecessary.
-- **Multi-table join reasoning beyond the crosswalk tables.** The agent handles
-  block-group → city/county aggregation; more exotic joins are untested.
+4. **Use multiple safety layers.** An AI gate filters obviously unrelated or
+   off-topic questions. Python then validates generated SQL before
+   execution, execution has limits and timeouts, and the Snowflake
+   connection uses a read-only role. The goal was not to rely on the AI
+   alone for safety.
 
-## What I'd do differently with more time
+5. **Track an overall time budget.** The pipeline tracks the time spent on
+   each request so it stays within the 60-second requirement.
 
-1. **Hybrid retrieval (BM25 + embeddings).** The clearest weakness. Lexical
-   search misses questions phrased entirely in synonyms — "how rich is this
-   area?" shares no tokens with "median household income". Roughly a half-day:
-   embed the column descriptions once, blend the two ranked lists.
+---
 
-2. **An evaluation set with expected answers, not just expected columns.** Right
-   now I test that retrieval surfaces the right column and that the pipeline
-   degrades correctly. I don't test that the final number is *right*. I'd
-   hand-verify 25–30 questions against the ACS and assert on values.
+## 2. What I'd improve with more time
 
-3. **Surface margin of error.** ACS figures are estimates with MOE columns
-   sitting right next to them. Reporting a point estimate without its
-   uncertainty is a real correctness gap, not a cosmetic one.
+1. **A bigger set of test questions with checked answers.** I would expand
+   the current test set so more types of questions are compared against
+   known-correct results.
 
-4. **Cost and latency instrumentation per stage.** I know the pipeline fits in
-   60s; I can't currently tell you the p95 or which stage dominates.
+2. **A consistent approximation of county medians.** Right now the AI is
+   instructed how to approximate county medians, but different phrasings
+   could produce slightly different calculations. I would move that logic
+   into code so the same method is used every time.
 
-5. **Revisit `effort: medium` on SQL generation.** Chosen for latency without
-   measuring the quality cost. I'd sweep it against an eval set.
+3. **Embeddings alongside keyword search.** BM25 works well when the user's
+   wording overlaps with the Census labels. Embeddings could help when the
+   user uses very different wording.
 
-## Edge cases and failure modes I identified but did not fully address
+---
 
-- **Ambiguous place names.** "Springfield" matches ~30 places. The agent can
-  ask for clarification, but it has no ranked list of candidates to offer, so
-  the question comes back vaguer than it should.
-- **Synonym-only questions.** Covered above — the known consequence of lexical
-  retrieval.
-- **Silent aggregation errors.** If the model sums block groups with a wrong
-  crosswalk filter, the query succeeds and returns a plausible wrong number.
-  Nothing currently catches this; it's the failure mode I'd most want a
-  verification pass for.
-- **Margin of error.** The prompt forbids summing an estimate with its MOE, but
-  nothing enforces it.
-- **Estimate vs. count confusion.** ACS values are survey estimates, not
-  counts. The answer prompt says so; a user skimming may still read them as
-  exact.
-- **Very large result sets.** Capped at 500 rows, and only the first 50 reach
-  the answer prompt. A question whose answer needs the whole tail gets a
-  confidently incomplete summary.
-- **Rate limiting under concurrent reviewers.** Several people opening the demo
-  at once share one Anthropic key and one Snowflake warehouse. Handled as a
-  clean error, not queued.
-- _TODO: add anything you hit while building — especially things that broke._
+## 3. Edge cases and failure modes found but not fully fixed
 
-## Testing approach
+- **Wrong-but-believable numbers.** The SQL can run successfully but still
+  use the wrong Census field or geography. Live tests catch this only for
+  questions we already tested. With more time, I would add a second check
+  comparing the generated SQL back to the user's question.
 
-**What I test:** the code I wrote. 64 tests, no network or credentials
-required, full suite in ~0.1s.
+- **Ambiguous place names.** For place names like "Springfield," the app may
+  need to ask the user which location they mean.
 
-- `test_sql_validator.py` — the densest file, because it's the security
-  boundary. Stacked statements, writes hidden behind comments, writes inside
-  CTEs, LIMIT clamping, and the inverse case: quoted Census identifiers that
-  *contain* keyword-like words must not be falsely rejected.
-- `test_schema_index.py` — golden questions that must each retrieve a named
-  column. If retrieval misses, nothing downstream can recover.
-- `test_pipeline.py` — orchestration against a scripted model and stubbed
-  database: off-topic refusal, prompt injection, unanswerable questions,
-  ambiguity, database outage, query repair, repair budget exhaustion, and
-  follow-up rewriting.
+- **Places spanning counties.** For places like New York City, the app may
+  need clarification or must clearly state which county or borough it used.
 
-**The tradeoff:** scripting the model makes tests deterministic, free, and
-fast — and means I am testing my orchestration, not the model's judgment. A
-regression in SQL quality from a prompt change would not fail this suite.
+---
 
-**What I'd add:**
-1. An end-to-end eval set with verified expected values (see above) — the
-   biggest gap.
-2. Adversarial input as a regression corpus — every injection attempt I tried
-   by hand, asserted to never produce executable write SQL.
-3. Retrieval quality metrics (recall@20 over a labelled question set) so
-   retrieval changes are measurable rather than vibes.
-4. A single live smoke test against real Snowflake and a real model, run
-   manually before deploy. Everything else stays hermetic.
+## 4. Testing
 
-## Honest self-assessment
+**Unit tests.** Claude Code generated most of the test implementation, while
+I reviewed what was being tested and used the results to find and fix
+problems. The unit tests use a fake AI and fake database to test the Python
+logic without network calls, including SQL safety, schema search, pipeline
+behavior, retries, and error handling.
 
-_TODO: written last, after you know what actually shipped. Be specific — name
-the weakest part of the submission and why you accepted it. The brief says
-incomplete-but-self-aware scores better than complete-but-unreflective, and
-they mean it._
+**Search checks.** I used 18 test questions to verify that the correct Census
+columns appeared in the top search results. This helped measure whether
+retrieval changes actually improved the system.
 
-One concrete example to keep: my first cut of the retrieval relevance gate
-dropped any candidate scoring ≤ 0, which silently discarded correct matches
-because BM25 IDF goes negative for terms common across documents. A test
-caught it. That's the kind of bug that looks fine in a demo and is wrong in
-production.
+**Live tests.** I also ran 17 questions against the real Claude API and
+Snowflake database. These checked that the full system produced the expected
+SQL structure and known-correct results. One test was inconsistent because
+Claude sometimes omitted an ORDER BY for a "highest" question, so I chose to
+tighten the prompt and make the ORDER BY requirement explicit rather than
+weakening the test.
+
+**Trade-off.** Unit tests are fast and free, but they cannot catch changes in
+AI behavior. Live tests can, but they cost money and can be somewhat
+non-deterministic.
+
+With more time, I would expand the set of live questions with more
+hand-checked answers.
+
+---
+
+## 5. Self-assessment
+
+**Weakest part.** County-level medians are approximations rather than exact
+Census medians, so this is an area I would improve with more time.
+
+**Most confident in.** Failure handling. During testing, the app returned
+readable error messages instead of crashing when something went wrong.
+
+**What I'm still learning.** Claude Code wrote most of the Python
+implementation, so I am still building deeper familiarity with some of the
+lower-level details. I understand the overall architecture, the major
+trade-offs, and how the components work together, but I would not claim I
+could rewrite every module from scratch without assistance.

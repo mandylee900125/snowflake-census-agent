@@ -8,3 +8,6 @@ venv/
 .cache/
 *.egg-info/
 .DS_Store
+
+# Personal interview notes, not part of the submission
+notes/
