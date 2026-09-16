@@ -66,10 +66,12 @@ trade-offs to accept.
    the current test set so more types of questions are compared against
    known-correct results.
 
-2. **A consistent approximation of county medians.** Right now the AI is
-   instructed how to approximate county medians, but different phrasings
-   could produce slightly different calculations. I would move that logic
-   into code so the same method is used every time.
+2. **A consistent approximation of county medians.** The dataset provides
+   medians at the block-group level, and those cannot be combined to
+   calculate an exact county median. Right now the AI is instructed to
+   approximate them, but different phrasings could produce slightly
+   different calculations. I would move that approximation into code so the
+   same method is used every time.
 
 3. **Embeddings alongside keyword search.** BM25 works well when the user's
    wording overlaps with the Census labels. Embeddings could help when the
@@ -87,8 +89,12 @@ trade-offs to accept.
 - **Ambiguous place names.** For place names like "Springfield," the app may
   need to ask the user which location they mean.
 
-- **Places spanning counties.** For places like New York City, the app may
-  need clarification or must clearly state which county or borough it used.
+- **Places spanning counties.** A region like the Bay Area is nine counties,
+  not one. When I tested it, the app mapped "Bay Area" to the standard nine
+  counties, weighted the rents by renter units, and named that scope in the
+  answer — a good result. But it chose the county set from general
+  knowledge rather than asking, so for a region without a standard
+  definition it would state a guess rather than ask a question.
 
 ---
 
