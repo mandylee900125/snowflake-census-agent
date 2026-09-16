@@ -19,6 +19,32 @@ class LLMUnavailable(RuntimeError):
     """The model could not be reached, or declined to answer."""
 
 
+def describe_status_error(status_code):
+    # type: (int) -> str
+    """Turn an API status code into a sentence that says what to fix.
+
+    Shown to the user, and read by whoever deployed the app. "HTTP 401" is
+    honest but useless at 11pm; "the API key was rejected" is actionable.
+    """
+    if status_code == 401:
+        return ("The language model service rejected the API key. Check "
+                "ANTHROPIC_API_KEY in the deployment's secrets (or .env locally).")
+    if status_code == 403:
+        return ("The language model service refused this request (HTTP 403). "
+                "The API key may lack access to the configured model.")
+    if status_code == 404:
+        return ("The configured model was not found (HTTP 404). Check "
+                "SQL_MODEL / GUARDRAIL_MODEL.")
+    if status_code == 402 or status_code == 400:
+        return ("The language model service rejected the request (HTTP %s). "
+                "The account may be out of credit or the request malformed."
+                % status_code)
+    if status_code == 529 or status_code >= 500:
+        return ("The language model service is overloaded or down (HTTP %s). "
+                "Please retry in a moment." % status_code)
+    return "The language model service returned an error (HTTP %s)." % status_code
+
+
 class LLMClient(object):
     def __init__(self, api_key=None):
         # type: (Optional[str]) -> None
@@ -91,9 +117,7 @@ class LLMClient(object):
             ) from exc
         except a.APIStatusError as exc:
             log.exception("Anthropic API error")
-            raise LLMUnavailable(
-                "The language model service returned an error (HTTP %s)." % exc.status_code
-            ) from exc
+            raise LLMUnavailable(describe_status_error(exc.status_code)) from exc
 
     # --- public API ---------------------------------------------------------
 
@@ -144,8 +168,6 @@ class LLMClient(object):
                 self._check_refusal(stream.get_final_message())
         except a.APIStatusError as exc:
             log.exception("Anthropic streaming error")
-            raise LLMUnavailable(
-                "The language model service returned an error (HTTP %s)." % exc.status_code
-            ) from exc
+            raise LLMUnavailable(describe_status_error(exc.status_code)) from exc
         except a.APIConnectionError as exc:
             raise LLMUnavailable("Could not reach the language model service.") from exc

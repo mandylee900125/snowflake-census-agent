@@ -201,3 +201,20 @@ class TestConversationContext:
         sql_call = llm.calls[1]["user"]
         assert "Question: how many women?" in sql_call
         assert "B01001e26" in sql_call
+
+
+class TestErrorMessages:
+    """An operator reading the deployed app's error must know what to fix."""
+
+    def test_bad_api_key_names_the_secret_to_check(self):
+        from census_agent.llm import describe_status_error
+        msg = describe_status_error(401)
+        assert "ANTHROPIC_API_KEY" in msg and "401" not in msg
+
+    def test_outage_says_to_retry(self):
+        from census_agent.llm import describe_status_error
+        assert "retry" in describe_status_error(529).lower()
+
+    def test_unknown_status_still_reports_the_code(self):
+        from census_agent.llm import describe_status_error
+        assert "418" in describe_status_error(418)
